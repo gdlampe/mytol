@@ -59,6 +59,50 @@ export function isPointInPolygon(
   return isInside;
 }
 
+/** Radial and angular extent of a rectangle as seen from the origin. */
+export type PolarWindow = { rMin: number; rMax: number; all: boolean; aRef: number; aLo: number; aHi: number };
+
+function unwrapNear(a: number, ref: number): number {
+  while (a - ref > Math.PI) a -= 2 * Math.PI;
+  while (a - ref < -Math.PI) a += 2 * Math.PI;
+  return a;
+}
+
+/**
+ * Polar window of the rectangle [x0,x1]×[y0,y1] (coordinates relative to the
+ * origin). Used to cull ring cells: a cell is visible only if its radii overlap
+ * [rMin,rMax] and its angles overlap [aLo,aHi] (all angles if the origin is inside).
+ */
+export function polarWindow(x0: number, y0: number, x1: number, y1: number): PolarWindow {
+  const corners: [number, number][] = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]];
+  const rMax = Math.max(...corners.map(([x, y]) => Math.hypot(x, y)));
+  if (x0 <= 0 && x1 >= 0 && y0 <= 0 && y1 >= 0) {
+    return { rMin: 0, rMax, all: true, aRef: 0, aLo: -Math.PI, aHi: Math.PI };
+  }
+  const dx = x0 > 0 ? x0 : x1 < 0 ? -x1 : 0;
+  const dy = y0 > 0 ? y0 : y1 < 0 ? -y1 : 0;
+  // A convex region not containing the origin subtends < π, with its extreme
+  // angles at corners; unwrap around the direction to its centre.
+  const aRef = Math.atan2((y0 + y1) / 2, (x0 + x1) / 2);
+  let aLo = Infinity, aHi = -Infinity;
+  for (const [x, y] of corners) {
+    const a = unwrapNear(Math.atan2(y, x), aRef);
+    if (a < aLo) aLo = a;
+    if (a > aHi) aHi = a;
+  }
+  return { rMin: Math.hypot(dx, dy), rMax, all: false, aRef, aLo, aHi };
+}
+
+/** Does the angular interval [lo,hi] (radians, any winding) overlap the window? */
+export function arcInWindow(lo: number, hi: number, w: PolarWindow): boolean {
+  if (w.all || hi - lo >= Math.PI) return true;
+  // Unwrap around the window's own angular centre (not aRef): both half-widths
+  // are < π/2, so the overlapping 2π shift is unique.
+  const mid = (lo + hi) / 2;
+  const shift = unwrapNear(mid, (w.aLo + w.aHi) / 2) - mid;
+  return hi + shift >= w.aLo && lo + shift <= w.aHi;
+}
+
 // ============================================================
 // Categorical colour palette
 // ============================================================

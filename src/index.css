@@ -175,11 +175,92 @@ select {
   gap: 4px 8px;
   align-items: center;
 }
-.track-item:last-child { border-bottom: none; }
 .track-item-name { grid-column: 2 / 3; font-weight: bold; }
 .track-item-controls { grid-column: 2 / 3; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.track-item-order { grid-column: 1 / 2; grid-row: 1 / 3; display: flex; flex-direction: column; }
-.track-item-order button { padding: 0 4px; }
+.track-row { position: relative; }
+.track-row:last-child .track-item { border-bottom: none; }
+/* Insertion line drawn above the row's opaque children */
+.track-row.drop-before::before,
+.track-row.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: #4e79a7;
+  z-index: 1;
+  pointer-events: none;
+}
+.track-row.drop-before::before { top: -1px; }
+.track-row.drop-after::after { bottom: -1px; }
+.track-drag-handle {
+  grid-column: 1 / 2;
+  grid-row: 1 / 3;
+  cursor: grab;
+  color: #999;
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px 2px;
+  border-radius: 3px;
+  user-select: none;
+}
+.track-drag-handle:hover { color: #333; background: #eee; }
+.track-drag-handle:active { cursor: grabbing; }
+.track-drag-handle:focus-visible { outline: 2px solid #4e79a7; }
+
+/* ============================================================
+   Find by annotation
+   ============================================================ */
+
+.ann-value-list {
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #fff;
+}
+.ann-value-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ann-value-item:hover { background: #f0f0f0; }
+.ann-value-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+}
+.ann-value-name {
+  margin-right: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ann-results {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e3e3e3;
+}
+
+/* Inline rename box for the on-canvas legend */
+.legend-edit {
+  position: absolute;
+  z-index: 20;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  background: #fff;
+  padding: 2px;
+  border: 1px solid #4e79a7;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+.legend-edit input { font-family: sans-serif; padding: 1px 4px; }
 
 /* ============================================================
    Legend

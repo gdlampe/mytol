@@ -1,5 +1,6 @@
 import React, {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useCallback,
@@ -34,7 +35,10 @@ import {
   lerpColor,
   isPointInPolygon,
   originalCategoryColor,
+  polarWindow,
+  arcInWindow,
 } from "../lib/colorUtils";
+import type { PolarWindow } from "../lib/colorUtils";
 import {
   parseNewick,
   pruneAst,
@@ -49,6 +53,15 @@ import {
   rectToPolar,
 } from "../lib/treeLayout";
 import { parseAnnotations } from "../lib/parseAnnotations";
+import {
+  NO_VALUE,
+  cellValue,
+  commonAncestor,
+  findMatchingLeaves,
+} from "../lib/annotationFilter";
+import type { AnnotationFilter, NumericOp } from "../lib/annotationFilter";
+import { drawLegend, layoutLegend, legendFont, legendToSvg } from "../lib/legend";
+import type { LegendEditTarget, LegendHit, LegendLayout, LegendModel, LegendSection } from "../lib/legend";
 
 // ============================================================
 // Categorical colour palettes
@@ -62,6 +75,37 @@ const CATEGORICAL_PALETTES: { name: string; colors: string[] }[] = [
   { name: "Paired",      colors: ["#a6cee3","#1f78b4","#b2df8a","#33a02c","#fb9a99","#e31a1c","#ffdead","#ff7f00","#cab2d6","#6a3d9a","#ffff99","#b15928"] },
   { name: "Pastel",      colors: ["#fbb4ae","#b3cde3","#ccebc5","#decbe4","#fed9a6","#ffffcc","#e5d8bd","#fddaec","#f2f2f2"] },
 ];
+
+/** Longest category list drawn per legend section (the rest collapse to "… N more"). */
+const LEGEND_MAX_ENTRIES = 100;
+
+/**
+ * Integer input that can be typed into freely: in-range values apply as you
+ * type, anything else is clamped when the field loses focus or on Enter.
+ */
+function IntField({ value, min, max, onChange, style }: {
+  value: number; min: number; max: number; onChange: (v: number) => void; style?: React.CSSProperties;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = (s: string) => {
+    const n = Math.round(Number(s));
+    if (s.trim() !== "" && Number.isFinite(n)) onChange(clamp(n, min, max));
+    setDraft(null);
+  };
+  return (
+    <input
+      type="number" min={min} max={max} step={1} value={draft ?? value} style={style}
+      onChange={(e) => {
+        const s = e.target.value;
+        setDraft(s);
+        const n = Number(s);
+        if (s.trim() !== "" && Number.isInteger(n) && n >= min && n <= max) onChange(n);
+      }}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => { if (e.key === "Enter") commit(e.currentTarget.value); }}
+    />
+  );
+}
 
 // ============================================================
 // Node fingerprint helpers — stable identifiers across tree rebuilds
@@ -131,6 +175,45 @@ export default function Phylo() {
   const [trackOffsetMode, setTrackOffsetMode] = useState<"manual" | "auto">(
     "auto"
   );
+  // Radial layouts: when true, rings live in tree space — anchored at the
+  // tree's outer edge, with a width that scales with zoom. When false, rings
+  // hug the outermost visible branch with a fixed on-screen width.
+  const [tracksZoomWithTree, setTracksZoomWithTree] = useState(true);
+
+  // Track list drag-and-drop reordering
+  const dragTrackKey = useRef<string | null>(null);
+  const [trackDropTarget, setTrackDropTarget] = useState<{ index: number; after: boolean } | null>(null);
+
+  // ------------ Annotation search ------------
+
+  const [annSearchKey, setAnnSearchKey] = useState<string | null>(null);
+  const [annSearchValues, setAnnSearchValues] = useState<Set<string>>(() => new Set());
+  const [annSearchValueFilter, setAnnSearchValueFilter] = useState("");
+  const [annSearchOp, setAnnSearchOp] = useState<NumericOp>("gte");
+  const [annSearchA, setAnnSearchA] = useState("");
+  const [annSearchB, setAnnSearchB] = useState("");
+  const [annSearchInvert, setAnnSearchInvert] = useState(false);
+  const [annHighlight, setAnnHighlight] = useState(true);
+  const [annHighlightColor, setAnnHighlightColor] = useState("#e6007e");
+  const [annMatchCursor, setAnnMatchCursor] = useState(-1);
+
+  // ------------ On-canvas legend ------------
+
+  const [legendShow, setLegendShow] = useState(true);
+  const [legendTitle, setLegendTitle] = useState("Legend");
+  const [legendFontSize, setLegendFontSize] = useState(12);
+  const [legendColumns, setLegendColumns] = useState(1);
+  const [legendBox, setLegendBox] = useState(true);
+  const [legendOnlyPresent, setLegendOnlyPresent] = useState(true);
+  /** Top-left corner in canvas px; null = default corner. */
+  const [legendPos, setLegendPos] = useState<{ x: number; y: number } | null>(null);
+  /** Section ids left out of the legend (track sections are "track:<key>"). */
+  const [legendExcluded, setLegendExcluded] = useState<Set<string>>(() => new Set(["support"]));
+  const [legendHiddenEntries, setLegendHiddenEntries] = useState<Set<string>>(() => new Set());
+  /** Legend-only text overrides keyed by section/entry id (data is untouched). */
+  const [legendLabels, setLegendLabels] = useState<Record<string, string>>({});
+  const [legendEdit, setLegendEdit] = useState<{ hit: LegendHit; value: string } | null>(null);
+  const [editingRangeGroup, setEditingRangeGroup] = useState<number[] | null>(null);
 
   // ------------ Layout / view state ------------
 
@@ -216,6 +299,7 @@ export default function Phylo() {
   const [panelVisible, setPanelVisible] = useState(true);
   const [sectionOpen, setSectionOpen] = useState({
     files: true, export: false, ranges: false, layout: true, tree: true, tracks: false, support: false, options: false,
+    annSearch: true, legend: false,
   });
   const toggleSection = (key: keyof typeof sectionOpen) =>
     setSectionOpen((s) => ({ ...s, [key]: !s[key] }));
@@ -228,6 +312,25 @@ export default function Phylo() {
   const dragging = useRef(false);
   const last = useRef({ x: 0, y: 0 });
   const wasDragging = useRef(false);
+
+  // Legend placement from the last draw (canvas px) — used for hit-testing.
+  const legendBoxRef = useRef<{ x: number; y: number; layout: LegendLayout } | null>(null);
+  const legendDrag = useRef<{ startX: number; startY: number; origX: number; origY: number; moved: boolean } | null>(null);
+  // Set when a legend drag ends so the trailing click doesn't select a node.
+  const legendDragMoved = useRef(false);
+  // Set once an inline legend edit is committed/cancelled/hidden, so the blur
+  // fired when the input unmounts doesn't commit a second time.
+  const legendEditClosed = useRef(false);
+  const legendEditRef = useRef<HTMLDivElement | null>(null);
+
+  // Keep the inline rename box inside the canvas (it is wider than short labels).
+  useLayoutEffect(() => {
+    const el = legendEditRef.current, cont = containerRef.current;
+    if (!el || !cont) return;
+    const left = parseFloat(el.style.left) || 0, top = parseFloat(el.style.top) || 0;
+    el.style.left = `${clamp(left, 0, Math.max(0, cont.clientWidth - el.offsetWidth))}px`;
+    el.style.top = `${clamp(top, 0, Math.max(0, cont.clientHeight - el.offsetHeight))}px`;
+  }, [legendEdit?.hit]);
 
   // Pending remap: fingerprints saved before a hide/show-only rebuild so
   // collapsed nodes and ranges survive the tree rebuild.
@@ -366,14 +469,21 @@ export default function Phylo() {
           if (isNaN(num)) isContinuous = false;
           else if (num > maxVal) maxVal = num;
         }
-        if (!isContinuous) cats.add(val.toString());
+        // Always collect: numeric-looking values seen before the first
+        // non-numeric one still need colours if the column is categorical.
+        cats.add(val.toString());
       }
       colMeta.set(col, { isContinuous, maxVal: maxVal > 0 ? maxVal : 1, cats });
     }
 
     setTrackConfig(prev => {
       const prevByKey = new Map(prev.map(t => [t.key, t]));
-      return allColumns.map(col => {
+      // Keep the user's ring order for existing columns; new columns go last, in file order.
+      const ordered = [
+        ...prev.map(t => t.key).filter(k => colMeta.has(k)),
+        ...allColumns.filter(c => !prevByKey.has(c)),
+      ];
+      return ordered.map(col => {
         const meta = colMeta.get(col)!;
         const existing = prevByKey.get(col);
         const desiredType = meta.isContinuous ? "continuous" : "categorical";
@@ -420,20 +530,276 @@ export default function Phylo() {
     });
   }, [annotationFiles]);
 
-  // Append an annotation file. Parses then pushes onto the file list — the
-  // effect above rebuilds derived state.
-  const addAnnotationFile = async (file: File) => {
-    try {
-      const { rows, columns } = await parseAnnotations(file);
-      setAnnotationFiles(prev => [...prev, { name: file.name, rows, columns }]);
-    } catch (e) {
-      console.error("Failed to parse annotations:", e);
-    }
+  // Append annotation files. Parses them in parallel, then pushes the ones that
+  // parsed onto the file list in the order given (one update) — the effect
+  // above rebuilds derived state.
+  const addAnnotationFiles = async (files: File[]) => {
+    const results = await Promise.allSettled(files.map(f => parseAnnotations(f)));
+    const added: Array<{ name: string; rows: AnnotationRow[]; columns: string[] }> = [];
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") added.push({ name: files[i].name, ...r.value });
+      else console.error(`Failed to parse annotations (${files[i].name}):`, r.reason);
+    });
+    if (added.length) setAnnotationFiles(prev => [...prev, ...added]);
   };
 
   const removeAnnotationFile = (idx: number) => {
     setAnnotationFiles(prev => prev.filter((_, i) => i !== idx));
   };
+
+  // ==========================================================
+  // Annotation search — find leaves by the value of one column
+  // ==========================================================
+
+  const annSearchTrack = trackConfig.find(t => t.key === annSearchKey) ?? null;
+
+  // Keep the chosen column valid as annotation files come and go.
+  useEffect(() => {
+    if (annSearchKey !== null && trackConfig.some(t => t.key === annSearchKey)) return;
+    setAnnSearchKey(trackConfig[0]?.key ?? null);
+  }, [trackConfig, annSearchKey]);
+
+  // A new column starts with a blank query.
+  useEffect(() => {
+    setAnnSearchValues(new Set());
+    setAnnSearchValueFilter("");
+    setAnnSearchA("");
+    setAnnSearchB("");
+  }, [annSearchKey]);
+
+  // Distinct values (with leaf counts) of a categorical column among the tree's
+  // leaves; only computed while the search section is open.
+  const annSearchIsCategorical = annSearchTrack?.type === "categorical";
+  const annSearchValueCounts = useMemo((): Array<[string, number]> => {
+    if (!tree || !annSearchKey || !annSearchIsCategorical || !sectionOpen.annSearch) return [];
+    const counts = new Map<string, number>();
+    for (const id of tree.leaves) {
+      const v = cellValue(annotations.get(tree.nodes[id].name || ""), annSearchKey);
+      const k = v === "" ? NO_VALUE : v;
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+    return [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  }, [tree, annotations, annSearchKey, annSearchIsCategorical, sectionOpen.annSearch]);
+
+  // Checklist rows: values matching the text filter (capped), plus any ticked
+  // values no longer present in the tree so they can still be unticked.
+  const ANN_LIST_MAX = 500;
+  const annValueRows = useMemo(() => {
+    const q = annSearchValueFilter.trim().toLowerCase();
+    const label = (v: string) => (v === NO_VALUE ? "(no value)" : v.toLowerCase());
+    const rows: Array<[string, number]> = [];
+    let total = 0;
+    const present = new Set<string>();
+    for (const e of annSearchValueCounts) {
+      present.add(e[0]);
+      if (q && !label(e[0]).includes(q)) continue;
+      total++;
+      if (rows.length < ANN_LIST_MAX) rows.push(e);
+    }
+    for (const v of annSearchValues) {
+      if (present.has(v) || (q && !label(v).includes(q))) continue;
+      total++;
+      rows.push([v, 0]);
+    }
+    return { rows, total };
+  }, [annSearchValueCounts, annSearchValueFilter, annSearchValues]);
+
+  // Memoised so hover re-renders (every canvas mousemove) skip these rows.
+  const annSearchColors = annSearchKey ? colorMaps.get(annSearchKey) : undefined;
+  const annValueListEl = useMemo(() => (
+    <div className="ann-value-list">
+      {annValueRows.rows.map(([v, count]) => (
+        <label key={v} className="ann-value-item">
+          <input
+            type="checkbox"
+            checked={annSearchValues.has(v)}
+            onChange={(e) => setAnnSearchValues(prev => {
+              const next = new Set(prev);
+              if (e.target.checked) next.add(v); else next.delete(v);
+              return next;
+            })}
+          />
+          {v !== NO_VALUE && annSearchColors?.get(v) && (
+            <span className="ann-value-swatch" style={{ background: annSearchColors.get(v) }} />
+          )}
+          <span className="ann-value-name" title={v === NO_VALUE ? "(no value)" : v}>{v === NO_VALUE ? <em>(no value)</em> : v}</span>
+          <span className="note">{count.toLocaleString()}</span>
+        </label>
+      ))}
+      {annValueRows.total > annValueRows.rows.length && (
+        <div className="note" style={{ padding: "2px 6px" }}>
+          … {(annValueRows.total - annValueRows.rows.length).toLocaleString()} more — type to narrow the list
+        </div>
+      )}
+    </div>
+  ), [annValueRows, annSearchValues, annSearchColors]);
+
+  const annSearchNumRange = useMemo(() => {
+    if (!tree || !annSearchKey || annSearchTrack?.type !== "continuous") return null;
+    let lo = Infinity, hi = -Infinity;
+    for (const id of tree.leaves) {
+      const v = cellValue(annotations.get(tree.nodes[id].name || ""), annSearchKey);
+      if (v.trim() === "") continue;
+      const n = Number(v);
+      if (isNaN(n)) continue;
+      if (n < lo) lo = n;
+      if (n > hi) hi = n;
+    }
+    return isFinite(lo) ? { lo, hi } : null;
+  }, [tree, annotations, annSearchKey, annSearchTrack?.type]);
+
+  const annFilter = useMemo((): AnnotationFilter | null => {
+    if (!annSearchTrack) return null;
+    if (annSearchTrack.type === "categorical") {
+      if (annSearchValues.size === 0) return null;
+      return { kind: "categorical", key: annSearchTrack.key, values: annSearchValues, invert: annSearchInvert };
+    }
+    const a = parseFloat(annSearchA), b = parseFloat(annSearchB);
+    if (isNaN(a) || (annSearchOp === "between" && isNaN(b))) return null;
+    return { kind: "continuous", key: annSearchTrack.key, op: annSearchOp, a, b: isNaN(b) ? a : b, invert: annSearchInvert };
+  }, [annSearchTrack?.key, annSearchTrack?.type, annSearchValues, annSearchOp, annSearchA, annSearchB, annSearchInvert]);
+
+  // Matching leaf ids (display order) plus a per-node flag for O(1) lookups while drawing.
+  const annMatches = useMemo(() => {
+    if (!tree || !annFilter) return null;
+    const ids = findMatchingLeaves(tree, annotations, annFilter);
+    const flag = new Uint8Array(tree.nodes.length);
+    for (const id of ids) flag[id] = 1;
+    return { ids, flag };
+  }, [tree, annotations, annFilter]);
+
+  // For each leaf (by leafIndex), the collapsed clade drawn in its place, or -1.
+  // Same top-down rule as draw()'s skipNode: the first collapsed node met from
+  // the root (excluding the root) stands for its whole clade.
+  const collapsedRepByLeaf = useMemo(() => {
+    if (!tree || collapsedNodes.size === 0) return null;
+    const rep = new Int32Array(tree.leaves.length).fill(-1);
+    const stack = [tree.root];
+    while (stack.length) {
+      const id = stack.pop()!;
+      const nd = tree.nodes[id];
+      if (id !== tree.root && collapsedNodes.has(id)) {
+        for (let i = nd.L; i < nd.R; i++) rep[i] = id;
+        continue;
+      }
+      for (const ch of nd.children) stack.push(ch);
+    }
+    return rep;
+  }, [tree, collapsedNodes]);
+
+  // Prev/Next targets: matches in leaf order, with matches inside a collapsed
+  // clade replaced by that clade (once), since those leaves aren't drawn.
+  // matchReps: the collapsed clades that contain at least one match.
+  const annStepTargets = useMemo(() => {
+    const targets: number[] = [];
+    const matchReps = new Set<number>();
+    let inCollapsed = 0;
+    if (!tree || !annMatches) return { targets, matchReps, inCollapsed };
+    for (const id of annMatches.ids) {
+      const rep = collapsedRepByLeaf ? collapsedRepByLeaf[tree.nodes[id].leafIndex] : -1;
+      if (rep >= 0) { inCollapsed++; matchReps.add(rep); }
+      const t = rep >= 0 ? rep : id;
+      if (targets[targets.length - 1] !== t) targets.push(t);
+    }
+    return { targets, matchReps, inCollapsed };
+  }, [tree, annMatches, collapsedRepByLeaf]);
+
+  useEffect(() => { setAnnMatchCursor(-1); }, [annStepTargets]);
+
+  // ==========================================================
+  // Legend model
+  // ==========================================================
+
+  // Categories present among the tree's current leaves, per categorical track.
+  const catTrackKeysSig = trackConfig.filter(t => t.type === "categorical").map(t => t.key).join("\x00");
+  const presentCategories = useMemo(() => {
+    const m = new Map<string, Set<string>>();
+    if (!tree || !catTrackKeysSig) return m;
+    const keys = catTrackKeysSig.split("\x00");
+    for (const k of keys) m.set(k, new Set());
+    for (const id of tree.leaves) {
+      const row = annotations.get(tree.nodes[id].name || "");
+      if (!row) continue;
+      for (const k of keys) {
+        const v = cellValue(row, k);
+        if (v !== "") m.get(k)!.add(v);
+      }
+    }
+    return m;
+  }, [tree, annotations, catTrackKeysSig]);
+
+  const treeHasSupport = useMemo(() => !!tree && tree.nodes.some(n => n.support !== undefined), [tree]);
+
+  const legendModel = useMemo((): LegendModel | null => {
+    if (!tree || !legendShow) return null;
+    const text = (id: string, fallback: string) => legendLabels[id] ?? fallback;
+    const sections: LegendSection[] = [];
+
+    // One section per visible annotation ring, in ring order.
+    if (showTracks) {
+      for (const t of trackConfig) {
+        if (!t.visible) continue;
+        const sid = `track:${t.key}`;
+        if (legendExcluded.has(sid)) continue;
+        if (t.type === "categorical") {
+          const cmap = colorMaps.get(t.key);
+          if (!cmap) continue;
+          const present = legendOnlyPresent ? presentCategories.get(t.key) : undefined;
+          const shown = [...cmap].filter(([cat]) =>
+            (!present || present.has(cat)) && !legendHiddenEntries.has(`${sid}\x00${cat}`)
+          );
+          const entries = shown.slice(0, LEGEND_MAX_ENTRIES).map(([cat, color]) => {
+            const id = `${sid}\x00${cat}`;
+            const edit: LegendEditTarget = { type: "category", trackKey: t.key, category: cat };
+            return { id, label: text(id, cat), color, fillAlpha: 1, edit };
+          });
+          if (entries.length) {
+            sections.push({ id: sid, title: t.label, kind: "swatches", entries, more: shown.length - entries.length });
+          }
+        } else {
+          sections.push({
+            id: sid, title: t.label, kind: "ramp", min: "0", max: String(+(t.maxVal ?? 1).toPrecision(4)),
+            style: layout === "unrooted" ? "opacity" : "bar",
+          });
+        }
+      }
+    }
+
+    // Coloured ranges, merged by label + colour.
+    if (ranges.length > 0 && !legendExcluded.has("ranges")) {
+      const groups = new Map<string, { label: string; color: string; indices: number[] }>();
+      ranges.forEach((r, i) => {
+        const label = r.label || `Node ${r.nodeId}`;
+        const key = `${label}\x00${r.color}`;
+        const g = groups.get(key);
+        if (g) g.indices.push(i);
+        else groups.set(key, { label, color: r.color, indices: [i] });
+      });
+      const entries = [...groups].map(([key, g]) => {
+        const edit: LegendEditTarget = { type: "ranges", indices: g.indices };
+        return { id: `ranges\x00${key}`, label: g.label, color: g.color, fillAlpha: rangeDisplayMode === "background" ? 0.33 : 1, edit };
+      }).filter(e => !legendHiddenEntries.has(e.id));
+      if (entries.length) sections.push({ id: "ranges", title: text("ranges", "Coloured ranges"), kind: "swatches", entries, more: 0 });
+    }
+
+    if (optSupportColouring && treeHasSupport && !legendExcluded.has("support")) {
+      const fmt = (v: number) => (supportAsPercent ? v.toFixed(0) : String(+v.toFixed(2)));
+      sections.push({
+        id: "support", title: text("support", "Branch support"), kind: "gradient",
+        stops: [supportC0, supportC1, supportC2].map(color => ({ color, opacity: 1 })),
+        labels: [fmt(supportV0), fmt(supportV1), fmt(supportV2)],
+        edits: (["low", "mid", "high"] as const).map(slot => ({ type: "support" as const, slot })),
+      });
+    }
+
+    return { title: legendTitle, sections };
+  }, [
+    tree, legendShow, legendLabels, legendTitle, legendExcluded, legendHiddenEntries, legendOnlyPresent,
+    showTracks, trackConfig, colorMaps, presentCategories, layout,
+    ranges, rangeDisplayMode,
+    optSupportColouring, treeHasSupport, supportAsPercent,
+    supportC0, supportC1, supportC2, supportV0, supportV1, supportV2,
+  ]);
 
   // ==========================================================
   // Colouring helpers
@@ -464,6 +830,13 @@ export default function Phylo() {
   // Track positioning helpers (auto/manual)
   // ==========================================================
 
+  // World units per track-height px in radial layouts. Rings that zoom with
+  // the tree are laid out in world units; otherwise their width stays fixed
+  // on screen, so the world-space thickness shrinks as you zoom in.
+  function trackWorldScale(): number {
+    return tracksZoomWithTree ? 1 : 1 / gZoom;
+  }
+
   // Computes the horizontal pixels-per-branch-length-unit for the rect layout.
   // In auto mode (hSpan === 0) the tree is sized to leave room for tracks + labels
   // so that both are always visible regardless of vertical zoom.
@@ -492,10 +865,11 @@ export default function Phylo() {
   ): { trackStartRadius: number; trackOuterRadius: number } {
     const { coords, maxX } = rectLayout;
     const globalBaseRadius = R;
+    const trackWorldWidth = effectiveTrackWidth * trackWorldScale();
 
-    if (!showTracks || trackOffsetMode === "manual") {
+    if (!showTracks || trackOffsetMode === "manual" || tracksZoomWithTree) {
       const trackStartRadius = globalBaseRadius + trackOffset;
-      return { trackStartRadius, trackOuterRadius: trackStartRadius + effectiveTrackWidth };
+      return { trackStartRadius, trackOuterRadius: trackStartRadius + trackWorldWidth };
     }
 
     // AUTO: hug the outermost visible leaf radius
@@ -521,7 +895,35 @@ export default function Phylo() {
 
     const baseRadius = maxVisibleRadius > 0 ? maxVisibleRadius : globalBaseRadius;
     const trackStartRadius = baseRadius + trackOffset;
-    return { trackStartRadius, trackOuterRadius: trackStartRadius + effectiveTrackWidth };
+    return { trackStartRadius, trackOuterRadius: trackStartRadius + trackWorldWidth };
+  }
+
+  // Ring cells for the circular layout: one per sampled leaf (every leafStep-th),
+  // spanning exactly that leaf's slot of the arc — so cells are centred on their
+  // leaf and abut their neighbours — narrowed or widened by optBarFill.
+  // Cells outside `win` (if given) are dropped before their annotation lookup.
+  function circularRingCells(
+    N: number,
+    leafStep: number,
+    skipNode: Uint8Array,
+    win?: PolarWindow
+  ): Array<{ lo: number; hi: number; row: AnnotationRow | undefined }> {
+    const cells: Array<{ lo: number; hi: number; row: AnnotationRow | undefined }> = [];
+    if (!tree) return cells;
+    const startRad = (rotation * Math.PI) / 180;
+    const arcRad = (arc * Math.PI) / 180;
+    for (let i = 0; i < tree.leaves.length; i += leafStep) {
+      const leafId = tree.leaves[i];
+      if (skipNode[leafId] === 2) continue;
+      const hi = startRad - (i / N) * arcRad;
+      const lo = startRad - (Math.min(i + leafStep, N) / N) * arcRad;
+      // Inset first, then cull on the extent actually drawn (bar fill > 1 widens cells).
+      const inset = ((hi - lo) * (1 - optBarFill)) / 2;
+      const cLo = lo + inset, cHi = hi - inset;
+      if (win && !arcInWindow(cLo, cHi, win)) continue;
+      cells.push({ lo: cLo, hi: cHi, row: annotations.get(tree.nodes[leafId].name || "") });
+    }
+    return cells;
   }
 
   function computeUnrootedTrackRadii(
@@ -533,10 +935,11 @@ export default function Phylo() {
   ): { ringR: number; trackOuterRingR: number } {
     const { coords, maxR: computedMaxR } = unrootLayout;
     const globalBaseRadius = computedMaxR * R;
+    const trackWorldWidth = effectiveTrackWidth * trackWorldScale();
 
-    if (!showTracks || trackOffsetMode === "manual") {
+    if (!showTracks || trackOffsetMode === "manual" || tracksZoomWithTree) {
       const ringR = globalBaseRadius + trackOffset;
-      return { ringR, trackOuterRingR: ringR + effectiveTrackWidth };
+      return { ringR, trackOuterRingR: ringR + trackWorldWidth };
     }
 
     // AUTO: hug the outermost visible leaf
@@ -555,7 +958,7 @@ export default function Phylo() {
 
     const baseRadius = maxVisibleRadius > 0 ? maxVisibleRadius : globalBaseRadius;
     const ringR = baseRadius + trackOffset;
-    return { ringR, trackOuterRingR: ringR + effectiveTrackWidth };
+    return { ringR, trackOuterRingR: ringR + trackWorldWidth };
   }
 
   // ==========================================================
@@ -685,6 +1088,11 @@ export default function Phylo() {
     // Branch colour: range override → support colour → default
     const nodeColor = (id: number, support?: number): string =>
       nodeRangeColor.get(id) ?? (optSupportColouring && support !== undefined ? supportColor(support) : "#333");
+
+    // Leaf label colour: annotation-search match → range colour → default
+    const matchFlag = annHighlight && annMatches ? annMatches.flag : null;
+    const labelColor = (leafId: number): string =>
+      matchFlag && matchFlag[leafId] ? annHighlightColor : nodeRangeColor.get(leafId) ?? "#222";
 
     // ------ Highlight helpers (defined here to close over shared vars) ------
 
@@ -958,7 +1366,7 @@ export default function Phylo() {
       const startAngleDeg = rotation;
       const arcDeg = arc;
 
-      const { trackStartRadius, trackOuterRadius } = computeCircularTrackRadii(
+      const { trackOuterRadius } = computeCircularTrackRadii(
         W, H, { coords: rectCoords as any[], maxX: rectMaxX }, R, N, effectiveTrackWidth
       );
 
@@ -1060,7 +1468,7 @@ export default function Phylo() {
 
       // Leaf labels (circular)
       if (showLeafLabels) {
-        const labelR = trackStartRadius + effectiveTrackWidth / gZoom + 6 / gZoom;
+        const labelR = trackOuterRadius + 6 / gZoom;
         const arcPerLeaf = N > 0 ? ((arcDeg * Math.PI) / 180) / N : 0;
         const labelSpacingPx = labelR * arcPerLeaf * gZoom;
         if (labelSpacingPx >= 6) {
@@ -1078,7 +1486,7 @@ export default function Phylo() {
             const lx = labelR * Math.cos(angle);
             const ly = labelR * Math.sin(angle);
             if (!worldVisible(lx, ly)) continue;
-            ctx.fillStyle = nodeRangeColor.get(leafId) ?? "#222";
+            ctx.fillStyle = labelColor(leafId);
             ctx.save();
             ctx.translate(lx, ly);
             const cosA = Math.cos(angle);
@@ -1159,11 +1567,20 @@ export default function Phylo() {
 
         if (sortedLeafIds.length > 0) {
           const arcPerLeaf = (2 * Math.PI) / sortedLeafIds.length;
+          const k = trackWorldScale();
           let currentR = ringR;
+          // Cull by annular sector against the (padded) world viewport, so thick
+          // zoomed rings stay drawn even when their inner edge is off-screen.
+          const win = polarWindow(
+            worldXMin - worldCullMargin, worldYMin - worldCullMargin,
+            worldXMax + worldCullMargin, worldYMax + worldCullMargin
+          );
 
           for (const track of trackConfig) {
-            if (!track.visible) { currentR += track.height + TRACK_PADDING; continue; }
-            const r1 = currentR, r2 = r1 + track.height;
+            if (!track.visible) continue;
+            const r1 = currentR, r2 = r1 + track.height * k;
+            currentR += (track.height + TRACK_PADDING) * k;
+            if (r2 < win.rMin || r1 > win.rMax) continue;
             const arcPx = r1 * arcPerLeaf * gZoom;
             const leafStep = Math.max(1, Math.floor(optLodMinPx / Math.max(arcPx, 1e-9)));
 
@@ -1190,8 +1607,7 @@ export default function Phylo() {
               const a1 = coords[leafIdA].angle;
               const a2raw = coords[leafIdB].angle;
               const a2 = a2raw > a1 ? a2raw : a2raw + 2 * Math.PI;
-              const midA = (a1 + a2) / 2;
-              if (!worldVisible(r1 * Math.cos(midA), r1 * Math.sin(midA))) continue;
+              if (!arcInWindow(a1, a2, win)) continue;
 
               if (!colorSegs.has(color)) colorSegs.set(color, []);
               colorSegs.get(color)!.push([a1, a2]);
@@ -1208,8 +1624,6 @@ export default function Phylo() {
               }
               ctx.fill();
             }
-
-            currentR += track.height + TRACK_PADDING;
           }
         }
       }
@@ -1220,7 +1634,7 @@ export default function Phylo() {
         const labelSpacingPx = ringR * arcPerLeaf * gZoom;
         if (labelSpacingPx >= 6) {
           const fontSize = Math.min(Math.floor(labelSpacingPx * 0.75 * optFontScale), 13 * optFontScale);
-          const labelOffset = effectiveTrackWidth + trackOffset + 6 / gZoom;
+          const labelOffset = effectiveTrackWidth * trackWorldScale() + trackOffset + 6 / gZoom;
           ctx.save();
           ctx.font = `${fontSize / gZoom}px sans-serif`;
           ctx.textBaseline = "middle";
@@ -1236,7 +1650,7 @@ export default function Phylo() {
             const px = lx + labelOffset * (lx / len);
             const py = ly + labelOffset * (ly / len);
             if (!worldVisible(px, py)) continue;
-            ctx.fillStyle = nodeRangeColor.get(leafId) ?? "#222";
+            ctx.fillStyle = labelColor(leafId);
             ctx.save();
             ctx.translate(px, py);
             const cosA = Math.cos(dirAngle);
@@ -1292,8 +1706,10 @@ export default function Phylo() {
     ctx.restore();
 
     // ---- Circular layout: annotation tracks as screen-space overlay ----
-    // Drawn after ctx.restore() so track heights are constant screen pixels regardless of zoom.
-    // The inner radius tracks the outermost visible branch (via computeCircularTrackRadii auto mode).
+    // Drawn after ctx.restore() in screen pixels. With tracksZoomWithTree the ring
+    // radius and heights are scaled by gZoom (ring zooms with the tree); otherwise
+    // heights are constant screen pixels and the inner radius tracks the outermost
+    // visible branch (via computeCircularTrackRadii auto mode).
     if (layout === "circular" && showTracks && effectiveTrackWidth > 0 && rectLayout) {
       const R = Math.min(W, H) * CIRC_RADIUS_FRACTION;
       const N = leaves.length || 1;
@@ -1304,64 +1720,56 @@ export default function Phylo() {
         W, H, { coords: rectCoords as any[], maxX: rectMaxX }, R, N, effectiveTrackWidth
       );
       const trackStartR_screen = trackStartRadius * gZoom;
+      const trackPx = tracksZoomWithTree ? gZoom : 1; // screen px per track-height px
+      const trackOuterR_screen = trackStartR_screen + effectiveTrackWidth * trackPx;
       const leafArcPx = trackStartR_screen * anglePerLeaf;
       const leafStep = leafArcPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafArcPx)) : 1;
 
-      const leafData: Array<{ a: number; row: any }> = [];
-      for (let idx = 0; idx < leaves.length; idx += leafStep) {
-        const leafId = leaves[idx];
-        if (skipNode[leafId] === 2) continue;
-        const nd = nodes[leafId];
-        const pRect = (rectCoords as any)[leafId];
-        const { angle } = rectToPolar(rectMaxX > 0 ? pRect.x / rectMaxX : 0, pRect.y, N, R, rotation, arc);
-        const sx_l = cx + trackStartR_screen * Math.cos(angle);
-        const sy_l = cy + trackStartR_screen * Math.sin(angle);
-        if (sx_l < -50 || sx_l > W + 50 || sy_l < -50 || sy_l > H + 50) continue;
-        leafData.push({ a: angle, row: annotations.get(nd.name || "") });
-      }
-      leafData.sort((a, b) => a.a - b.a);
+      // Cull cells against the viewport in polar terms, so rings far wider than
+      // the screen (zoomed in) still draw exactly the visible cells.
+      const pad = 50;
+      const win = polarWindow(-pad - cx, -pad - cy, W + pad - cx, H + pad - cy);
+      const cells = trackOuterR_screen >= win.rMin && trackStartR_screen <= win.rMax
+        ? circularRingCells(N, leafStep, skipNode, win)
+        : [];
 
-      if (leafData.length > 0) {
-        const maxSegAngle = arc < 360 ? 1.5 * (arcRad / leafData.length) : Infinity;
+      if (cells.length > 0) {
         ctx.save();
         ctx.translate(cx, cy);
         let currentR = trackStartR_screen;
         for (const track of trackConfig) {
-          if (!track.visible) { currentR += track.height + TRACK_PADDING; continue; }
-          const r1 = currentR, r2 = r1 + track.height;
+          if (!track.visible) continue;
+          const r1 = currentR, r2 = r1 + track.height * trackPx;
+          currentR += (track.height + TRACK_PADDING) * trackPx;
+          if (r2 < win.rMin || r1 > win.rMax) continue;
           const colorSegs = new Map<string, Array<[number, number, number]>>();
-          for (let i = 0; i < leafData.length; i++) {
-            const { a, row } = leafData[i];
-            const nextRaw = leafData[(i + 1) % leafData.length].a;
-            const a2full = nextRaw > a ? nextRaw : nextRaw + 2 * Math.PI;
-            if (a2full - a > maxSegAngle) continue;
-            const a2 = a + (a2full - a) * optBarFill;
+          for (const { lo, hi, row } of cells) {
             const val = row ? row[track.key] : undefined;
             if (val === null || val === undefined || val === "") continue;
-            let color: string, rEnd = r1;
+            let color: string, rOut = r2;
             if (track.type === "categorical") {
               color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa";
             } else {
+              // Continuous: bar grows outward from the inner edge.
               const num = Number(val);
               if (isNaN(num)) continue;
-              rEnd = r1 + Math.min(1, Math.max(0, num / (track.maxVal || 1))) * (r2 - r1);
+              rOut = r1 + Math.min(1, Math.max(0, num / (track.maxVal || 1))) * (r2 - r1);
               color = "#666";
             }
             if (!colorSegs.has(color)) colorSegs.set(color, []);
-            colorSegs.get(color)!.push([a, a2, rEnd]);
+            colorSegs.get(color)!.push([lo, hi, rOut]);
           }
           for (const [color, segs] of colorSegs) {
             ctx.fillStyle = color;
             ctx.beginPath();
-            for (const [a1, a2, rEnd] of segs) {
-              ctx.moveTo(r2 * Math.cos(a1), r2 * Math.sin(a1));
-              ctx.arc(0, 0, r2, a1, a2, false);
-              ctx.arc(0, 0, rEnd, a2, a1, true);
+            for (const [lo, hi, rOut] of segs) {
+              ctx.moveTo(rOut * Math.cos(lo), rOut * Math.sin(lo));
+              ctx.arc(0, 0, rOut, lo, hi, false);
+              ctx.arc(0, 0, r1, hi, lo, true);
               ctx.closePath();
             }
             ctx.fill();
           }
-          currentR += track.height + TRACK_PADDING;
         }
         ctx.restore();
       }
@@ -1388,7 +1796,7 @@ export default function Phylo() {
           const row = annotations.get(nd.name || "");
           let currentX = overlayTrackX;
           for (const track of trackConfig) {
-            if (!track.visible) { currentX += track.height + TRACK_PADDING; continue; }
+            if (!track.visible) continue;
             const val = row ? row[track.key] : undefined;
             if (val === null || val === undefined || val === "") { currentX += track.height + TRACK_PADDING; continue; }
             if (track.type === "categorical") {
@@ -1420,7 +1828,7 @@ export default function Phylo() {
           const name = nodes[leafId].name;
           if (!name) continue;
           const screenY = H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
-          ctx.fillStyle = nodeRangeColor.get(leafId) ?? "#222";
+          ctx.fillStyle = labelColor(leafId);
           ctx.fillText(name, overlayLabelX, screenY);
         }
         ctx.restore();
@@ -1492,6 +1900,109 @@ export default function Phylo() {
         ctx.restore();
       }
     }
+
+    // ---- Annotation-search matches: dots at leaf tips (screen space) ----
+    // Matches inside a collapsed clade get one dot on the collapsed glyph.
+    // Dots are thinned on a grid about one dot wide, so the number drawn is
+    // bounded by screen area rather than by the number of matches.
+    if (matchFlag && annMatches && annMatches.ids.length > 0) {
+      const cx = W / 2 + offset.x, cy = H / 2 + offset.y;
+      const N = leaves.length || 1;
+      const Rc = Math.min(W, H) * CIRC_RADIUS_FRACTION;
+      const Ru = unrootedLayout ? Rc / (unrootedLayout.maxR || 1) : 0;
+      const arcRad = (arc * Math.PI) / 180;
+      const dotR = 3.5;
+      const cell = 5;
+      const gw = Math.ceil(W / cell) + 2, gh = Math.ceil(H / cell) + 2;
+      const grid = new Uint8Array(gw * gh);
+      let drawn = 0;
+      ctx.save();
+      ctx.beginPath();
+      const addDot = (px: number, py: number) => {
+        if (px < -dotR || px > W + dotR || py < -dotR || py > H + dotR) return;
+        const gi = (Math.floor(py / cell) + 1) * gw + Math.floor(px / cell) + 1;
+        if (grid[gi]) return;
+        grid[gi] = 1;
+        drawn++;
+        ctx.moveTo(px + dotR, py);
+        ctx.arc(px, py, dotR, 0, 2 * Math.PI);
+      };
+      // Screen position of a leaf tip, or of the collapsed glyph for a collapsed node.
+      const dotAt = (id: number, collapsed: boolean) => {
+        const nd = nodes[id];
+        if (layout === "rect") {
+          const a = (rectCoords as any)[id];
+          let wx = -W / 2 + PADDING + sx * a.x, wy = -H / 2 + PADDING + sy * a.y;
+          if (collapsed) {
+            wx += Math.min((nd.R - nd.L) * sy * 0.4, 60 / vZoom);
+            wy = -H / 2 + PADDING + (sy * (nd.L + nd.R)) / 2;
+          }
+          addDot(cx + wx, cy + vZoom * wy);
+        } else if (layout === "circular") {
+          const a = (rectCoords as any)[id];
+          const P = rectToPolar(rectMaxX > 0 ? a.x / rectMaxX : 0, a.y, N, Rc, rotation, arc);
+          let r = P.radius, ang = P.angle;
+          if (collapsed) {
+            r += Math.min((nd.R - nd.L) * (arcRad / N) * Rc * 0.4, 40 / gZoom);
+            ang = (rotation * Math.PI) / 180 - ((nd.L + nd.R) / 2 / N) * arcRad;
+          }
+          addDot(cx + gZoom * r * Math.cos(ang), cy + gZoom * r * Math.sin(ang));
+        } else if (unrootedLayout) {
+          const p = unrootedLayout.coords[id];
+          addDot(cx + gZoom * p.x * Ru, cy + gZoom * p.y * Ru);
+        }
+      };
+      // Rect: only leaves in the visible row range (ids are in leaf order).
+      let ids = annMatches.ids;
+      if (layout === "rect") {
+        const lower = (target: number) => {
+          let lo = 0, hi = ids.length;
+          while (lo < hi) { const m = (lo + hi) >> 1; if (nodes[ids[m]].leafIndex < target) lo = m + 1; else hi = m; }
+          return lo;
+        };
+        ids = ids.slice(lower(visibleLeafStart), lower(visibleLeafEnd));
+      }
+      for (const id of ids) if (skipNode[id] !== 2) dotAt(id, false);
+      // One dot per collapsed clade containing matches (screen-culled in addDot,
+      // so it shows even when the matching rows themselves are off-screen).
+      for (const rep of annStepTargets.matchReps) if (skipNode[rep] === 1) dotAt(rep, true);
+      ctx.fillStyle = annHighlightColor;
+      ctx.fill();
+      if (drawn < 5000) {
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // ---- Legend (screen space, drawn last so it sits on top) ----
+    legendBoxRef.current = null;
+    const legendLayout = computeLegendLayout(ctx);
+    if (legendLayout) {
+      const margin = 16;
+      const lx = clamp(legendPos ? legendPos.x : margin, 0, Math.max(0, W - legendLayout.w));
+      const ly = clamp(legendPos ? legendPos.y : margin, 0, Math.max(0, H - legendLayout.h));
+      drawLegend(ctx, legendLayout, lx, ly);
+      legendBoxRef.current = { x: lx, y: ly, layout: legendLayout };
+    }
+  }
+
+  // Legend layout for the current model/style, measured with the given context.
+  function computeLegendLayout(ctx: CanvasRenderingContext2D): LegendLayout | null {
+    if (!legendModel || legendModel.sections.length === 0) return null;
+    ctx.save();
+    const measure = (text: string, size: number, bold: boolean) => {
+      ctx.font = legendFont(size, bold);
+      return ctx.measureText(text).width;
+    };
+    const L = layoutLegend(
+      legendModel,
+      { fontSize: legendFontSize, columns: legendColumns, box: legendBox, background: optBackground },
+      measure
+    );
+    ctx.restore();
+    return L;
   }
 
   // Bug fix: added collapsedNodes and hiddenNodes to the dependency array so
@@ -1527,6 +2038,9 @@ export default function Phylo() {
     optFontScale, optLodMinPx, nodeWidthPx, optBarFill,
     optBackground, optShowSupportLabels, optSupportColouring,
     rangeDisplayMode,
+    tracksZoomWithTree,
+    annMatches, annHighlight, annHighlightColor, annStepTargets,
+    legendModel, legendPos, legendFontSize, legendColumns, legendBox,
   ]);
 
   // ==========================================================
@@ -1686,6 +2200,16 @@ export default function Phylo() {
   // Mouse move / tooltips
   // ==========================================================
 
+  // Legend hit-test in canvas px: null when outside the legend box, otherwise
+  // the specific element under the point (or null hit for the box background).
+  function legendAt(x: number, y: number): { hit: LegendHit | null } | null {
+    const lb = legendBoxRef.current;
+    if (!lb || x < lb.x || y < lb.y || x > lb.x + lb.layout.w || y > lb.y + lb.layout.h) return null;
+    const lx = x - lb.x, ly = y - lb.y;
+    const hit = lb.layout.hits.find(h => lx >= h.x && lx <= h.x + h.w && ly >= h.y && ly <= h.y + h.h) ?? null;
+    return { hit };
+  }
+
   function onMouseMove(e: React.MouseEvent) {
     if (!tree || !rectLayout) return;
     const canvas = canvasRef.current!;
@@ -1694,6 +2218,14 @@ export default function Phylo() {
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
     const W = cont.clientWidth, H = cont.clientHeight;
+
+    const overLegend = legendAt(x, y);
+    if (overLegend) {
+      setHoverNode(null);
+      setHoverInfo(null);
+      setCursorStyle(overLegend.hit?.kind === "swatch" ? "pointer" : "move");
+      return;
+    }
 
     const wx = layout === "rect" ? x - W / 2 - offset.x : (x - W / 2 - offset.x) / gZoom;
     const wy = layout === "rect" ? (y - H / 2 - offset.y) / vZoom : (y - H / 2 - offset.y) / gZoom;
@@ -1791,15 +2323,30 @@ export default function Phylo() {
   // Click & drag
   // ==========================================================
 
+  const openLegendSwatch = (edit: LegendEditTarget) => {
+    if (edit.type === "category") setEditingColor({ trackKey: edit.trackKey, category: edit.category });
+    else if (edit.type === "ranges") setEditingRangeGroup(edit.indices);
+    else setEditingSupportSlot(edit.slot);
+  };
+
   function onClick(e: React.MouseEvent) {
     if (!tree || wasDragging.current) { wasDragging.current = false; return; }
-    if (showRangePanel) { setShowRangePanel(false); setEditingRangeIndex(null); }
 
     const canvas = canvasRef.current!;
     const cont = containerRef.current!;
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
     const W = cont.clientWidth, H = cont.clientHeight;
+
+    // Clicks on the legend never select nodes; a click on a swatch recolours it.
+    if (legendDragMoved.current) { legendDragMoved.current = false; return; }
+    const onLegend = legendAt(x, y);
+    if (onLegend) {
+      if (onLegend.hit?.kind === "swatch" && onLegend.hit.edit) openLegendSwatch(onLegend.hit.edit);
+      return;
+    }
+
+    if (showRangePanel) { setShowRangePanel(false); setEditingRangeIndex(null); }
     const wx = layout === "rect" ? x - W / 2 - offset.x : (x - W / 2 - offset.x) / gZoom;
     const wy = layout === "rect" ? (y - H / 2 - offset.y) / vZoom : (y - H / 2 - offset.y) / gZoom;
 
@@ -1815,6 +2362,15 @@ export default function Phylo() {
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
     const W = cont.clientWidth, H = cont.clientHeight;
+
+    // Double-click legend text to rename it in place.
+    const onLegend = legendAt(x, y);
+    if (onLegend) {
+      const hit = onLegend.hit;
+      if (hit && hit.kind !== "swatch") openLegendEdit(hit);
+      return;
+    }
+
     const wx = layout === "rect" ? x - W / 2 - offset.x : (x - W / 2 - offset.x) / gZoom;
     const wy = layout === "rect" ? (y - H / 2 - offset.y) / vZoom : (y - H / 2 - offset.y) / gZoom;
 
@@ -1830,24 +2386,52 @@ export default function Phylo() {
 
   function onMouseDown(e: React.MouseEvent) {
     wasDragging.current = false;
+    legendDragMoved.current = false;
+    legendDrag.current = null;
+    // Left button only: a right-click's mouseup goes to the context menu, which
+    // would otherwise leave a drag stuck to the cursor.
+    if (e.button !== 0 || e.ctrlKey) return;
+    const lb = legendBoxRef.current;
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (lb && rect && legendAt(e.clientX - rect.left, e.clientY - rect.top)) {
+      // Drag the legend instead of panning the tree.
+      legendDrag.current = { startX: e.clientX, startY: e.clientY, origX: lb.x, origY: lb.y, moved: false };
+      setCursorStyle("move");
+      return;
+    }
     dragging.current = true;
     last.current = { x: e.clientX, y: e.clientY };
     setCursorStyle("grabbing");
   }
 
   function onMouseUp() {
+    if (legendDrag.current) {
+      legendDragMoved.current = legendDrag.current.moved;
+      legendDrag.current = null;
+    }
     dragging.current = false;
     setCursorStyle(hoverNode !== null ? "pointer" : "grab");
   }
 
   function onMouseLeave() {
     dragging.current = false;
+    legendDrag.current = null;
     setHoverInfo(null);
     setHoverNode(null);
     setCursorStyle("grab");
   }
 
   function onMouseMoveWrap(e: React.MouseEvent) {
+    // Drop any drag whose button was released outside our view of events.
+    if ((e.buttons & 1) === 0) { legendDrag.current = null; dragging.current = false; }
+    const ld = legendDrag.current;
+    if (ld) {
+      const dx = e.clientX - ld.startX, dy = e.clientY - ld.startY;
+      if (!ld.moved && Math.hypot(dx, dy) < 3) return;
+      ld.moved = true;
+      setLegendPos({ x: ld.origX + dx, y: ld.origY + dy });
+      return;
+    }
     onMouseMove(e);
     if (!dragging.current) return;
     if (!wasDragging.current) { setShowRangePanel(false); setEditingRangeIndex(null); }
@@ -2062,6 +2646,7 @@ export default function Phylo() {
   // Track UI helpers
   // ==========================================================
 
+  // Keyboard fallback for the drag handle (Arrow keys while it has focus).
   const moveTrack = (index: number, direction: "up" | "down") => {
     const newConfig = [...trackConfig];
     const target = direction === "up" ? index - 1 : index + 1;
@@ -2069,6 +2654,97 @@ export default function Phylo() {
     [newConfig[index], newConfig[target]] = [newConfig[target], newConfig[index]];
     setTrackConfig(newConfig);
   };
+
+  // Drag-and-drop: move the dragged track to just before/after the row it was dropped on.
+  const dropTrack = (targetIndex: number, after: boolean) => {
+    const fromKey = dragTrackKey.current;
+    dragTrackKey.current = null;
+    setTrackDropTarget(null);
+    if (!fromKey) return;
+    setTrackConfig(prev => {
+      const from = prev.findIndex(t => t.key === fromKey);
+      if (from < 0) return prev;
+      let to = targetIndex + (after ? 1 : 0);
+      if (from < to) to -= 1;
+      if (to === from) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  };
+
+  // ==========================================================
+  // Legend editing
+  // ==========================================================
+
+  const openLegendEdit = (hit: LegendHit) => {
+    legendEditClosed.current = false;
+    setLegendEdit({ hit, value: hit.text ?? "" });
+  };
+
+  const closeLegendEdit = () => {
+    legendEditClosed.current = true;
+    setLegendEdit(null);
+  };
+
+  const commitLegendEdit = (raw: string) => {
+    if (!legendEdit || legendEditClosed.current) return;
+    const { hit } = legendEdit;
+    const v = raw.trim();
+    // Unchanged text (e.g. clicking away) must not turn a display default such
+    // as an unlabelled range's "Node 12" into real data or an override.
+    if (v === (hit.text ?? "").trim()) { closeLegendEdit(); return; }
+    // Empty text (or a category's own name) reverts an override to its default.
+    const isDefault = !v || (hit.edit?.type === "category" && v === hit.edit.category);
+    const setOverride = (id: string) =>
+      setLegendLabels(prev => {
+        const next = { ...prev };
+        if (isDefault) delete next[id]; else next[id] = v;
+        return next;
+      });
+    if (hit.kind === "title") {
+      setLegendTitle(v);
+    } else if (hit.kind === "section") {
+      if (hit.id.startsWith("track:")) {
+        // Track sections share the track's display name with the panel.
+        const key = hit.id.slice("track:".length);
+        if (v) setTrackConfig(prev => prev.map(t => (t.key === key ? { ...t, label: v } : t)));
+      } else {
+        setOverride(hit.id);
+      }
+    } else if (hit.kind === "entry") {
+      if (hit.edit?.type === "ranges") {
+        // Range labels are user data already, so rename the ranges themselves.
+        const idx = new Set(hit.edit.indices);
+        setRanges(prev => prev.map((r, i) => (idx.has(i) ? { ...r, label: v } : r)));
+      } else {
+        setOverride(hit.id);
+      }
+    }
+    closeLegendEdit();
+  };
+
+  const hideLegendItem = (hit: LegendHit) => {
+    if (hit.kind === "title") setLegendTitle("");
+    else if (hit.kind === "section") setLegendExcluded(prev => new Set(prev).add(hit.id));
+    else setLegendHiddenEntries(prev => new Set(prev).add(hit.id));
+    closeLegendEdit();
+  };
+
+  const toggleLegendSection = (id: string, include: boolean) =>
+    setLegendExcluded(prev => {
+      const next = new Set(prev);
+      if (include) next.delete(id); else next.add(id);
+      return next;
+    });
+
+  // Sections the legend can show, for the panel checklist.
+  const legendSectionChoices: Array<{ id: string; label: string }> = [
+    ...(showTracks ? trackConfig.filter(t => t.visible).map(t => ({ id: `track:${t.key}`, label: t.label })) : []),
+    ...(ranges.length > 0 ? [{ id: "ranges", label: legendLabels["ranges"] ?? "Coloured ranges" }] : []),
+    ...(optSupportColouring && treeHasSupport ? [{ id: "support", label: legendLabels["support"] ?? "Branch support" }] : []),
+  ];
 
   const updateTrack = (index: number, key: "type" | "height" | "visible" | "label", value: any) => {
     const newConfig = [...trackConfig];
@@ -2238,7 +2914,7 @@ export default function Phylo() {
         lines.push('<g id="annotations">');
         let currentX = overlayTrackX;
         for (const track of trackConfig) {
-          if (!track.visible) { currentX += track.height + TRACK_PADDING; continue; }
+          if (!track.visible) continue;
           const cRects = new Map<string, string[]>();
           for (let i = 0; i < tree.leaves.length; i += leafStep) {
             const leafId = tree.leaves[i];
@@ -2346,49 +3022,38 @@ export default function Phylo() {
 
       // Annotation tracks — annular arc segments (matches canvas, supports optBarFill)
       if (showTracks) {
-        const leafArcPx = trackOuterRadius * anglePerLeaf * gZoom;
+        // Same cells, LOD and geometry as the canvas overlay (screen px; heights
+        // scaled by gZoom only when rings zoom with the tree).
+        const trackStartS = trackStartRadius * gZoom;
+        const leafArcPx = trackStartS * anglePerLeaf;
         const leafStep = leafArcPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafArcPx)) : 1;
-        // Collect leaf angles sorted ascending
-        const svgLeafData: Array<{ a: number; row: any }> = [];
-        for (let idx = 0; idx < tree.leaves.length; idx += leafStep) {
-          const leafId = tree.leaves[idx]; if (skipNode[leafId] === 2) continue;
-          const { angle } = getPolar(leafId);
-          svgLeafData.push({ a: angle, row: annotations.get(tree.nodes[leafId].name || "") });
-        }
-        svgLeafData.sort((x, y) => x.a - y.a);
+        const cells = circularRingCells(N, leafStep, skipNode);
+        const trackPx = tracksZoomWithTree ? gZoom : 1;
         lines.push('<g id="annotations">');
-        if (svgLeafData.length > 0) {
-          const svgMaxSegAngle = arcDeg < 360 ? 1.5 * (arcRad / svgLeafData.length) : Infinity;
-          let curR = trackStartRadius;
-          for (const track of trackConfig) {
-            if (!track.visible) { curR += track.height + TRACK_PADDING; continue; }
-            const r1s = curR * gZoom, r2s = (curR + track.height) * gZoom;
-            const cPaths = new Map<string, string[]>();
-            for (let i = 0; i < svgLeafData.length; i++) {
-              const { a, row } = svgLeafData[i];
-              const nextRaw = svgLeafData[(i + 1) % svgLeafData.length].a;
-              const a2full = nextRaw > a ? nextRaw : nextRaw + 2 * Math.PI;
-              if (a2full - a > svgMaxSegAngle) continue;
-              const a2 = a + (a2full - a) * optBarFill;
-              const val = row ? row[track.key] : undefined;
-              if (val === null || val === undefined || val === "") continue;
-              let color: string, rEnd = r1s;
-              if (track.type === "categorical") { color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa"; }
-              else { const n = Number(val); if (isNaN(n)) continue; rEnd = r1s + Math.min(1, Math.max(0, n / (track.maxVal || 1))) * (r2s - r1s); color = "#666"; }
-              if (!cPaths.has(color)) cPaths.set(color, []);
-              // SVG annular arc: outer arc CW (sweep=1), inner arc CCW (sweep=0)
-              let da = a2 - a; while (da > Math.PI) da -= 2 * Math.PI; while (da < -Math.PI) da += 2 * Math.PI;
-              const sf = da >= 0 ? 1 : 0;
-              const large = Math.abs(da) > Math.PI ? 1 : 0;
-              const [ox1, oy1] = [f(cx + r2s * Math.cos(a)), f(cy + r2s * Math.sin(a))];
-              const [ox2, oy2] = [f(cx + r2s * Math.cos(a2)), f(cy + r2s * Math.sin(a2))];
-              const [ix1, iy1] = [f(cx + rEnd * Math.cos(a2)), f(cy + rEnd * Math.sin(a2))];
-              const [ix2, iy2] = [f(cx + rEnd * Math.cos(a)), f(cy + rEnd * Math.sin(a))];
-              cPaths.get(color)!.push(`M ${ox1},${oy1} A ${f(r2s)},${f(r2s)} 0 ${large},${sf} ${ox2},${oy2} L ${ix1},${iy1} A ${f(rEnd)},${f(rEnd)} 0 ${large},${sf ^ 1} ${ix2},${iy2} Z`);
-            }
-            for (const [color, paths] of cPaths) lines.push(`<path fill="${color}" d="${paths.join(" ")}"/>`);
-            curR += track.height + TRACK_PADDING;
+        let curS = trackStartS;
+        for (const track of trackConfig) {
+          if (!track.visible) continue;
+          const r1s = curS, r2s = curS + track.height * trackPx;
+          curS += (track.height + TRACK_PADDING) * trackPx;
+          const cPaths = new Map<string, string[]>();
+          for (const { lo, hi, row } of cells) {
+            const val = row ? row[track.key] : undefined;
+            if (val === null || val === undefined || val === "") continue;
+            let color: string, rOut = r2s;
+            if (track.type === "categorical") { color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa"; }
+            else { const n = Number(val); if (isNaN(n)) continue; rOut = r1s + Math.min(1, Math.max(0, n / (track.maxVal || 1))) * (r2s - r1s); color = "#666"; }
+            if (!cPaths.has(color)) cPaths.set(color, []);
+            // Annular cell: outer arc lo→hi (sweep=1, clockwise on screen), inner arc back (sweep=0).
+            // Split at the midpoint so each arc is < π and a full-ring cell (≥ 2π) still draws.
+            const hiC = Math.min(hi, lo + 2 * Math.PI - 1e-6);
+            const mid = (lo + hiC) / 2;
+            const P = (r: number, a: number) => `${f(cx + r * Math.cos(a))},${f(cy + r * Math.sin(a))}`;
+            cPaths.get(color)!.push(
+              `M ${P(rOut, lo)} A ${f(rOut)},${f(rOut)} 0 0,1 ${P(rOut, mid)} A ${f(rOut)},${f(rOut)} 0 0,1 ${P(rOut, hiC)} ` +
+              `L ${P(r1s, hiC)} A ${f(r1s)},${f(r1s)} 0 0,0 ${P(r1s, mid)} A ${f(r1s)},${f(r1s)} 0 0,0 ${P(r1s, lo)} Z`
+            );
           }
+          for (const [color, paths] of cPaths) lines.push(`<path fill="${color}" d="${paths.join(" ")}"/>`);
         }
         lines.push('</g>');
       }
@@ -2477,11 +3142,12 @@ export default function Phylo() {
           .sort((a, b) => coords[a].angle - coords[b].angle);
         if (sortedLeafIds.length > 0) {
           const arcPerLeaf = (2 * Math.PI) / sortedLeafIds.length;
+          const k = trackWorldScale();
           let curR = ringR;
           lines.push('<g id="annotations">');
           for (const track of trackConfig) {
-            if (!track.visible) { curR += track.height + TRACK_PADDING; continue; }
-            const r1s = curR * gZoom, r2s = (curR + track.height) * gZoom;
+            if (!track.visible) continue;
+            const r1s = curR * gZoom, r2s = (curR + track.height * k) * gZoom;
             const arcPx = curR * arcPerLeaf * gZoom;
             const leafStep = Math.max(1, Math.floor(optLodMinPx / Math.max(arcPx, 1e-9)));
             const cPaths = new Map<string, string[]>();
@@ -2507,7 +3173,7 @@ export default function Phylo() {
               cPaths.get(color)!.push(`M ${f(ox1)},${f(oy1)} A ${f(r2s)},${f(r2s)} 0 ${large},1 ${f(ox2)},${f(oy2)} L ${f(ix1)},${f(iy1)} A ${f(r1s)},${f(r1s)} 0 ${large},0 ${f(ix2)},${f(iy2)} Z`);
             }
             for (const [color, paths] of cPaths) lines.push(`<path fill="${color}" d="${paths.join(" ")}"/>`);
-            curR += track.height + TRACK_PADDING;
+            curR += (track.height + TRACK_PADDING) * k;
           }
           lines.push('</g>');
         }
@@ -2519,7 +3185,7 @@ export default function Phylo() {
         const labelSpacingPx = ringR * arcPerLeaf * gZoom;
         if (labelSpacingPx >= 6) {
           const fz = Math.min(Math.floor(labelSpacingPx * 0.75 * optFontScale), 13 * optFontScale);
-          const labelOffsetPx = (effectiveTrackW + trackOffset) * gZoom + 6;
+          const labelOffsetPx = (effectiveTrackW * trackWorldScale() + trackOffset) * gZoom + 6;
           lines.push(`<g id="labels" font-family="sans-serif" font-size="${f(fz)}" fill="#222" dominant-baseline="middle">`);
           for (const leafId of tree.leaves) {
             if (skipNode[leafId] === 2) continue;
@@ -2539,6 +3205,12 @@ export default function Phylo() {
         }
       }
     }
+
+    // Legend at its on-screen position (same layout as the canvas).
+    const lb = legendBoxRef.current;
+    const measureCtx = canvasRef.current?.getContext("2d");
+    const legendLayout = lb && measureCtx ? computeLegendLayout(measureCtx) : null;
+    if (lb && legendLayout) lines.push(...legendToSvg(legendLayout, lb.x, lb.y));
 
     lines.push("</svg>");
     const blob = new Blob([lines.join("\n")], { type: "image/svg+xml" });
@@ -2598,8 +3270,13 @@ export default function Phylo() {
       newickText,
       layout, phylogram, ladderize, rotation, arc, hSpan,
       vZoom, gZoom, offset,
-      showLeafLabels, showTracks, trackOffset, trackOffsetMode,
+      showLeafLabels, showTracks, trackOffset, trackOffsetMode, tracksZoomWithTree,
       trackConfig,
+      legend: {
+        show: legendShow, title: legendTitle, fontSize: legendFontSize, columns: legendColumns,
+        box: legendBox, onlyPresent: legendOnlyPresent, pos: legendPos,
+        excluded: [...legendExcluded], hiddenEntries: [...legendHiddenEntries], labels: legendLabels,
+      },
       colorMaps: Object.fromEntries(
         [...colorMaps.entries()].map(([k, v]) => [k, Object.fromEntries(v)])
       ),
@@ -2642,7 +3319,26 @@ export default function Phylo() {
         if (s.showTracks !== undefined) setShowTracks(s.showTracks);
         if (s.trackOffset !== undefined) setTrackOffset(s.trackOffset);
         if (s.trackOffsetMode) setTrackOffsetMode(s.trackOffsetMode);
+        if (s.tracksZoomWithTree !== undefined) setTracksZoomWithTree(s.tracksZoomWithTree);
         if (s.trackConfig) setTrackConfig(s.trackConfig);
+        // Sessions saved before the legend existed get a default legend rather
+        // than inheriting renames/positions from whatever was open before.
+        {
+          const L = s.legend ?? {
+            show: true, title: "Legend", fontSize: 12, columns: 1, box: true, onlyPresent: true,
+            pos: null, excluded: ["support"], hiddenEntries: [], labels: {},
+          };
+          if (L.show !== undefined) setLegendShow(L.show);
+          if (L.title !== undefined) setLegendTitle(L.title);
+          if (L.fontSize !== undefined) setLegendFontSize(L.fontSize);
+          if (L.columns !== undefined) setLegendColumns(L.columns);
+          if (L.box !== undefined) setLegendBox(L.box);
+          if (L.onlyPresent !== undefined) setLegendOnlyPresent(L.onlyPresent);
+          if (L.pos !== undefined) setLegendPos(L.pos);
+          if (L.excluded) setLegendExcluded(new Set(L.excluded));
+          if (L.hiddenEntries) setLegendHiddenEntries(new Set(L.hiddenEntries));
+          if (L.labels) setLegendLabels(L.labels);
+        }
         if (s.colorMaps) {
           const cm = new Map<string, Map<string, string>>();
           for (const [k, v] of Object.entries(s.colorMaps)) {
@@ -2834,44 +3530,120 @@ export default function Phylo() {
     setCollapsedNodes((prev) => { const next = new Set(prev); next.add(selectedNode); return next; });
   };
 
+  // Remove leaves from the tree (by name) and rebuild. Collapsed nodes and
+  // ranges are carried across the rebuild via leaf-name fingerprints. Unions
+  // with existing hidden leaves so serial hides keep narrowing the view.
+  const hideLeafNames = (toHide: Set<string>) => {
+    if (!tree || toHide.size === 0) return;
+    const next = new Set([...hiddenLeafNames, ...toHide]);
+    // Hiding every leaf would prune the tree to nothing (the rebuild then falls
+    // back to the full tree and every later hide becomes a no-op), so refuse.
+    if (!tree.leaves.some(id => { const n = tree.nodes[id].name; return !n || !next.has(n); })) return;
+    remapCollapsedRef.current = [...collapsedNodes].map((id) => nodeToFingerprint(tree, id));
+    remapRangesRef.current = ranges.map((r) => ({ fp: nodeToFingerprint(tree, r.nodeId), color: r.color, label: r.label }));
+    remapPendingRef.current = true;
+    setHiddenLeafNames(next);
+  };
+
+  // Hide every leaf whose name is not in keepNames.
+  const showOnlyLeafNames = (keepNames: Set<string>) => {
+    if (!tree) return;
+    const hideNames = new Set<string>();
+    for (const leafId of tree.leaves) {
+      const name = tree.nodes[leafId].name;
+      if (name && !keepNames.has(name)) hideNames.add(name);
+    }
+    hideLeafNames(hideNames);
+  };
+
+  const cladeLeafNames = (nodeId: number): Set<string> => {
+    const names = new Set<string>();
+    if (!tree) return names;
+    const nd = tree.nodes[nodeId];
+    for (let i = nd.L; i < nd.R; i++) {
+      const name = tree.nodes[tree.leaves[i]].name;
+      if (name) names.add(name);
+    }
+    return names;
+  };
+
   // Rebuild the tree without the selected subtree's leaves.
   // The layout recomputes so spacing is correct in all three modes.
   const handleHideSelected = () => {
     if (selectedNode === null || !tree) return;
-    const nd = tree.nodes[selectedNode];
-    const toHide = new Set<string>();
-    for (let i = nd.L; i < nd.R; i++) {
-      const name = tree.nodes[tree.leaves[i]].name;
-      if (name) toHide.add(name);
-    }
-    if (toHide.size === 0) return;
-    remapCollapsedRef.current = [...collapsedNodes].map((id) => nodeToFingerprint(tree, id));
-    remapRangesRef.current = ranges.map((r) => ({ fp: nodeToFingerprint(tree, r.nodeId), color: r.color, label: r.label }));
-    remapPendingRef.current = true;
-    setHiddenLeafNames((prev) => new Set([...prev, ...toHide]));
+    hideLeafNames(cladeLeafNames(selectedNode));
   };
 
   // Rebuild the tree with ONLY the selected subtree's leaves visible.
   // Everything else is structurally removed, giving a clean focused view.
   const handleShowOnly = () => {
     if (selectedNode === null || !tree) return;
-    const nd = tree.nodes[selectedNode];
-    const keepNames = new Set<string>();
-    for (let i = nd.L; i < nd.R; i++) {
-      const name = tree.nodes[tree.leaves[i]].name;
-      if (name) keepNames.add(name);
-    }
-    const hideNames = new Set<string>();
-    for (const leafId of tree.leaves) {
-      const name = tree.nodes[leafId].name;
-      if (name && !keepNames.has(name)) hideNames.add(name);
-    }
-    remapCollapsedRef.current = [...collapsedNodes].map((id) => nodeToFingerprint(tree, id));
-    remapRangesRef.current = ranges.map((r) => ({ fp: nodeToFingerprint(tree, r.nodeId), color: r.color, label: r.label }));
-    remapPendingRef.current = true;
-    // Union with existing hidden leaves so serial "show only" keeps narrowing the view
-    setHiddenLeafNames((prev) => new Set([...prev, ...hideNames]));
+    showOnlyLeafNames(cladeLeafNames(selectedNode));
   };
+
+  // ---- Annotation search actions ----
+
+  const matchLeafNames = (): string[] => {
+    if (!tree || !annMatches) return [];
+    const names: string[] = [];
+    for (const id of annMatches.ids) {
+      const name = tree.nodes[id].name;
+      if (name) names.push(name);
+    }
+    return names;
+  };
+
+  // Step through matches (collapsed clades count once), panning to each in turn.
+  const stepAnnMatch = (dir: 1 | -1) => {
+    const { targets } = annStepTargets;
+    const n = targets.length;
+    if (n === 0) return;
+    const next = annMatchCursor < 0 ? (dir === 1 ? 0 : n - 1) : (annMatchCursor + dir + n) % n;
+    setAnnMatchCursor(next);
+    focusNode(targets[next]);
+  };
+
+  // Select the smallest clade containing every match, so the usual selection
+  // actions (colour range, collapse, reroot, …) apply to it.
+  const handleSelectMatchClade = () => {
+    if (!tree || !annMatches) return;
+    const id = commonAncestor(tree, annMatches.ids);
+    if (id === null) return;
+    setSelectedNode(id);
+    setShowRangePanel(false);
+  };
+
+  const handleCopyMatches = () => {
+    const names = matchLeafNames();
+    if (!names.length) return;
+    navigator.clipboard.writeText(names.join("\n")).catch((err) => console.error("Failed to copy:", err));
+  };
+
+  const handleSaveMatches = () => {
+    const names = matchLeafNames();
+    if (!names.length) return;
+    const url = URL.createObjectURL(new Blob([names.join("\n")], { type: "text/plain" }));
+    const aEl = document.createElement("a");
+    aEl.href = url; aEl.download = "matching-leaves.txt"; aEl.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleClearAnnSearch = () => {
+    setAnnSearchValues(new Set());
+    setAnnSearchA("");
+    setAnnSearchB("");
+    setAnnSearchInvert(false);
+  };
+
+  // Selected node's clade: how many of its leaves match the current search.
+  const selectedCladeMatchCount = useMemo(() => {
+    if (!tree || !annMatches || selectedNode === null) return null;
+    const nd = tree.nodes[selectedNode];
+    if (!nd) return null;
+    let n = 0;
+    for (let i = nd.L; i < nd.R; i++) if (annMatches.flag[tree.leaves[i]]) n++;
+    return n;
+  }, [tree, annMatches, selectedNode]);
 
   // ==========================================================
   // Hover clade stats
@@ -2958,10 +3730,16 @@ export default function Phylo() {
     setSuggestIx(list.length ? 0 : -1);
   }, [searchText, allLeafNames]);
 
-  const focusLeafByName = useCallback((name: string) => {
-    if (!tree || !rectLayout || !containerRef.current) return;
+  function focusLeafByName(name: string) {
     const id = leafNameToId.get(name);
     if (id == null) return;
+    focusNode(id);
+    setShowSuggests(false); setSuggestions([]);
+  }
+
+  // Select a node (leaf or collapsed clade) and pan so it sits at the centre of the view.
+  function focusNode(id: number) {
+    if (!tree || !rectLayout || !containerRef.current) return;
     setSelectedNode(id);
     const W = containerRef.current.clientWidth;
     const H = containerRef.current.clientHeight;
@@ -2984,8 +3762,7 @@ export default function Phylo() {
       const p = coords[id];
       setOffset({ x: -gZoom * (p.x * R), y: -gZoom * (p.y * R) });
     }
-    setShowSuggests(false); setSuggestions([]);
-  }, [tree, rectLayout, unrootedLayout, layout, phylogram, hSpan, vZoom, gZoom, rotation, arc, leafNameToId]);
+  }
 
   useEffect(() => {
     const onDocClick = () => setShowSuggests(false);
@@ -3040,7 +3817,7 @@ export default function Phylo() {
             <label className="label">Annotations (CSV/TSV)</label>
             <div className="file-input-row">
               <button type="button" className="btn" onClick={() => csvInputRef.current?.click()}>
-                {annotationFiles.length > 0 ? "Add file…" : "Choose file…"}
+                {annotationFiles.length > 0 ? "Add files…" : "Choose files…"}
               </button>
               <span className="note file-input-name">
                 {annotationFiles.length === 0
@@ -3051,10 +3828,11 @@ export default function Phylo() {
                 type="file"
                 ref={csvInputRef}
                 accept=".csv,.tsv"
+                multiple
                 style={{ display: "none" }}
                 onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) addAnnotationFile(file);
+                  const files = Array.from(e.target.files ?? []);
+                  if (files.length) addAnnotationFiles(files);
                   e.target.value = "";
                 }}
               />
@@ -3199,6 +3977,113 @@ export default function Phylo() {
           </div>
         </div>
 
+        {/* ── SECTION: Find by annotation ── */}
+        {trackConfig.length > 0 && (<>
+          <div className="section-header" onClick={() => toggleSection("annSearch")}>
+            <span>Find by annotation{annMatches ? ` (${annMatches.ids.length.toLocaleString()})` : ""}</span>
+            <span>{sectionOpen.annSearch ? "▲" : "▼"}</span>
+          </div>
+          {sectionOpen.annSearch && (
+            <div className="row ann-search">
+              <select value={annSearchKey ?? ""} onChange={(e) => setAnnSearchKey(e.target.value || null)} style={{ width: "100%", marginBottom: 6 }}>
+                {trackConfig.map(t => <option key={t.key} value={t.key}>{t.label || t.key}</option>)}
+              </select>
+
+              {annSearchTrack?.type === "categorical" && (<>
+                <input
+                  type="text"
+                  value={annSearchValueFilter}
+                  placeholder={`Filter ${annSearchValueCounts.length} values…`}
+                  onChange={(e) => setAnnSearchValueFilter(e.target.value)}
+                  style={{ width: "100%", boxSizing: "border-box", marginBottom: 4 }}
+                />
+                {annValueListEl}
+                <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                  <button type="button" className="btn" style={{ fontSize: 11, padding: "2px 6px" }}
+                    title="Add every value matching the filter (including any beyond the list cap) to the selection"
+                    onClick={() => {
+                      const q = annSearchValueFilter.trim().toLowerCase();
+                      const add = annSearchValueCounts
+                        .map(([v]) => v)
+                        .filter(v => !q || (v === NO_VALUE ? "(no value)" : v.toLowerCase()).includes(q));
+                      setAnnSearchValues(prev => new Set([...prev, ...add]));
+                    }}
+                  >{annSearchValueFilter.trim() ? "Tick listed" : "Tick all"}</button>
+                  <button type="button" className="btn" style={{ fontSize: 11, padding: "2px 6px" }} onClick={() => setAnnSearchValues(new Set())}>Untick all</button>
+                </div>
+              </>)}
+
+              {annSearchTrack?.type === "continuous" && (<>
+                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                  <select value={annSearchOp} onChange={(e) => setAnnSearchOp(e.target.value as NumericOp)}>
+                    <option value="gte">≥</option>
+                    <option value="gt">&gt;</option>
+                    <option value="lte">≤</option>
+                    <option value="lt">&lt;</option>
+                    <option value="eq">=</option>
+                    <option value="between">between</option>
+                  </select>
+                  <input type="number" value={annSearchA} onChange={(e) => setAnnSearchA(e.target.value)} style={{ width: 64 }} placeholder="value" />
+                  {annSearchOp === "between" && (<>
+                    <span className="note">and</span>
+                    <input type="number" value={annSearchB} onChange={(e) => setAnnSearchB(e.target.value)} style={{ width: 64 }} placeholder="value" />
+                  </>)}
+                </div>
+                {annSearchNumRange && (
+                  <div className="note" style={{ marginTop: 2 }}>
+                    Range in tree: {annSearchNumRange.lo.toLocaleString()} – {annSearchNumRange.hi.toLocaleString()}
+                  </div>
+                )}
+              </>)}
+
+              <label className="note" style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
+                <input type="checkbox" checked={annSearchInvert} onChange={(e) => setAnnSearchInvert(e.target.checked)} />
+                Invert (match everything else)
+              </label>
+
+              {annMatches && (
+                <div className="ann-results">
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                    <strong style={{ fontSize: 13 }}>{annMatches.ids.length.toLocaleString()}</strong>
+                    <span className="note" style={{ marginRight: "auto" }}>of {(tree?.leaves.length ?? 0).toLocaleString()} leaves match</span>
+                    <button type="button" className="btn" style={{ padding: "0 6px" }} disabled={!annStepTargets.targets.length} onClick={() => stepAnnMatch(-1)} title="Previous match">◀</button>
+                    <span className="note" style={{ minWidth: 34, textAlign: "center" }}>
+                      {annMatchCursor >= 0 ? `${annMatchCursor + 1}` : "–"}
+                    </span>
+                    <button type="button" className="btn" style={{ padding: "0 6px" }} disabled={!annStepTargets.targets.length} onClick={() => stepAnnMatch(1)} title="Next match">▶</button>
+                  </div>
+                  {annStepTargets.inCollapsed > 0 && (
+                    <div className="note" style={{ marginTop: -4, marginBottom: 6 }}>
+                      {annStepTargets.inCollapsed.toLocaleString()} inside collapsed clades (one dot per clade)
+                    </div>
+                  )}
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                    <label className="note" style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <input type="checkbox" checked={annHighlight} onChange={(e) => setAnnHighlight(e.target.checked)} />
+                      Highlight on tree
+                    </label>
+                    <input type="color" value={annHighlightColor} onChange={(e) => setAnnHighlightColor(e.target.value)}
+                      title="Highlight colour" style={{ width: 28, height: 20, padding: 0, border: "1px solid #ccc", borderRadius: 3 }} />
+                  </div>
+                  <div className="selection-actions">
+                    <button className="btn" onClick={handleSelectMatchClade} disabled={!annMatches.ids.length}
+                      title="Select the smallest clade containing every match">Select clade</button>
+                    <button className="btn" onClick={handleCopyMatches} disabled={!annMatches.ids.length}>Copy</button>
+                    <button className="btn" onClick={handleSaveMatches} disabled={!annMatches.ids.length}>Save</button>
+                  </div>
+                  <div className="selection-actions" style={{ marginTop: 4 }}>
+                    <button className="btn" onClick={() => hideLeafNames(new Set(matchLeafNames()))}
+                      disabled={!annMatches.ids.length || annMatches.ids.length === tree?.leaves.length}
+                      title={annMatches.ids.length === tree?.leaves.length ? "Every leaf matches — nothing would be left" : undefined}
+                    >Hide matches</button>
+                    <button className="btn" onClick={() => showOnlyLeafNames(new Set(matchLeafNames()))} disabled={!annMatches.ids.length}>Show only</button>
+                    <button className="btn" onClick={handleClearAnnSearch}>Clear</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </>)}
 
         {/* Selection panel */}
         {selectedNodeInfo && (
@@ -3211,6 +4096,9 @@ export default function Phylo() {
               <strong>Leaves:</strong> {(selectedNodeInfo as any).leaves ?? selectedNodeInfo.R - selectedNodeInfo.L}<br />
               <strong>Length:</strong> {selectedNodeInfo.length.toFixed(4)}<br />
               <strong>Support:</strong> {selectedNodeInfo.support ?? "N/A"}
+              {selectedCladeMatchCount !== null && (<>
+                <br /><strong>Search matches:</strong> {selectedCladeMatchCount.toLocaleString()}
+              </>)}
             </div>
             <div className="selection-actions">
               <button className="btn active" onClick={handleColorRangeClick}>{showRangePanel ? "Cancel Range" : "Colour Range"} (C)</button>
@@ -3412,8 +4300,12 @@ export default function Phylo() {
           {sectionOpen.tracks && (
             <div className="row">
               <div style={{ marginBottom: 8 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 6 }}>
+                  <input type="checkbox" checked={tracksZoomWithTree} onChange={(e) => setTracksZoomWithTree(e.target.checked)} />
+                  Rings zoom with tree
+                </label>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 4 }}>
-                  <div className="toggle-pill">
+                  <div className="toggle-pill" style={tracksZoomWithTree ? { opacity: 0.45, pointerEvents: "none" } : undefined}>
                     <button type="button" className={trackOffsetMode === "auto" ? "active" : ""} onClick={() => setTrackOffsetMode("auto")}>Auto</button>
                     <button type="button" className={trackOffsetMode === "manual" ? "active" : ""} onClick={() => setTrackOffsetMode("manual")}>Manual</button>
                   </div>
@@ -3422,7 +4314,11 @@ export default function Phylo() {
                     <input type="number" step={10} min={-999} value={trackOffset} onChange={(e) => setTrackOffset(Number(e.target.value) || 0)} style={{ width: 60, marginLeft: 4 }} />
                   </label>
                 </div>
-                <div className="note">Auto: tracks start at outermost visible branch + offset.</div>
+                <div className="note">
+                  {tracksZoomWithTree
+                    ? "Circular/unrooted: rings sit at the tree's outer edge and scale with zoom."
+                    : "Rings keep a fixed on-screen width. Auto: start at outermost visible branch + offset."}
+                </div>
               </div>
               {trackConfig.some(t => t.type === "categorical") && (
                 <div style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
@@ -3440,14 +4336,63 @@ export default function Phylo() {
                   </select>
                 </div>
               )}
-              <div className="track-config-list">
+              <div
+                className="track-config-list"
+                onDragLeave={(e) => {
+                  // Clear the insertion line once the drag really leaves the list
+                  // (bounds check: relatedTarget is null on dragleave in Safari).
+                  if (!dragTrackKey.current) return;
+                  const r = e.currentTarget.getBoundingClientRect();
+                  if (e.clientX <= r.left || e.clientX >= r.right || e.clientY <= r.top || e.clientY >= r.bottom) {
+                    setTrackDropTarget(null);
+                  }
+                }}
+              >
                 {trackConfig.map((track, i) => (
-                  <div key={track.key}>
+                  <div
+                    key={track.key}
+                    className={
+                      "track-row" +
+                      (trackDropTarget?.index === i ? (trackDropTarget.after ? " drop-after" : " drop-before") : "")
+                    }
+                    onDragOver={(e) => {
+                      if (!dragTrackKey.current) return;
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = "move";
+                      const r = e.currentTarget.getBoundingClientRect();
+                      const after = e.clientY > r.top + r.height / 2;
+                      setTrackDropTarget(prev => (prev?.index === i && prev.after === after ? prev : { index: i, after }));
+                    }}
+                    onDrop={(e) => {
+                      if (!dragTrackKey.current) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      const r = e.currentTarget.getBoundingClientRect();
+                      dropTrack(i, e.clientY > r.top + r.height / 2);
+                    }}
+                  >
                     <div className="track-item">
-                      <div className="track-item-order">
-                        <button onClick={() => moveTrack(i, "up")} disabled={i === 0}>▲</button>
-                        <button onClick={() => moveTrack(i, "down")} disabled={i === trackConfig.length - 1}>▼</button>
-                      </div>
+                      <span
+                        className="track-drag-handle"
+                        draggable
+                        role="button"
+                        tabIndex={0}
+                        title="Drag to reorder (or focus and use ↑/↓)"
+                        aria-label={`Reorder ${track.label}`}
+                        onDragStart={(e) => {
+                          dragTrackKey.current = track.key;
+                          e.dataTransfer.effectAllowed = "move";
+                          // Private type: text fields ignore it on drop (Firefox needs some setData to start a drag).
+                          e.dataTransfer.setData("application/x-mytol-track", track.key);
+                          const row = e.currentTarget.closest(".track-row");
+                          if (row) e.dataTransfer.setDragImage(row, 12, 12);
+                        }}
+                        onDragEnd={() => { dragTrackKey.current = null; setTrackDropTarget(null); }}
+                        onKeyDown={(e) => {
+                          if (e.key === "ArrowUp") { e.preventDefault(); moveTrack(i, "up"); }
+                          else if (e.key === "ArrowDown") { e.preventDefault(); moveTrack(i, "down"); }
+                        }}
+                      >⠿</span>
                       <input type="checkbox" style={{ gridColumn: "3 / 4", gridRow: "1 / 3" }} checked={track.visible} onChange={(e) => updateTrack(i, "visible", e.target.checked)} />
                       {/* Editable display name */}
                       <input
@@ -3504,6 +4449,65 @@ export default function Phylo() {
                     )}
                   </div>
                 ))}
+              </div>
+            </div>
+          )}
+        </>)}
+
+        {/* ── SECTION: Legend ── */}
+        {tree && (<>
+          <div className="section-header" onClick={() => toggleSection("legend")}>
+            <span>Legend</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <label style={{ fontSize: 12, fontWeight: "normal" }} onClick={(e) => e.stopPropagation()}>
+                <input type="checkbox" checked={legendShow} onChange={(e) => setLegendShow(e.target.checked)} /> Show
+              </label>
+              <span>{sectionOpen.legend ? "▲" : "▼"}</span>
+            </div>
+          </div>
+          {sectionOpen.legend && (
+            <div className="row">
+              <div className="note" style={{ marginBottom: 6 }}>
+                Drag the legend to move it. Double-click any text to rename it; click a swatch to recolour.
+              </div>
+              <label className="label" style={{ fontSize: 12 }}>Title</label>
+              <input type="text" value={legendTitle} onChange={(e) => setLegendTitle(e.target.value)} placeholder="(no title)"
+                style={{ width: "100%", boxSizing: "border-box", marginBottom: 6 }} />
+              {([
+                ["Font size", legendFontSize, setLegendFontSize, 8, 32],
+                ["Columns", legendColumns, setLegendColumns, 1, 6],
+              ] as [string, number, (v: number) => void, number, number][]).map(([label, val, setter, min, max]) => (
+                <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                  <span style={{ fontSize: 12 }}>{label}</span>
+                  <IntField value={val} min={min} max={max} onChange={setter} style={{ width: 70, fontSize: 12 }} />
+                </div>
+              ))}
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 4 }}>
+                <input type="checkbox" checked={legendBox} onChange={(e) => setLegendBox(e.target.checked)} />
+                Background box
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 8 }}>
+                <input type="checkbox" checked={legendOnlyPresent} onChange={(e) => setLegendOnlyPresent(e.target.checked)} />
+                Only categories present in the tree
+              </label>
+              <div className="note" style={{ fontWeight: 600, marginBottom: 4 }}>Include</div>
+              {legendSectionChoices.length === 0 && <div className="note">Nothing to show yet — load annotations or add coloured ranges.</div>}
+              {legendSectionChoices.map(s => (
+                <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 2 }}>
+                  <input type="checkbox" checked={!legendExcluded.has(s.id)} onChange={(e) => toggleLegendSection(s.id, e.target.checked)} />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.label}</span>
+                </label>
+              ))}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+                <button type="button" className="btn" onClick={() => setLegendPos(null)} disabled={!legendPos}>Reset position</button>
+                {legendHiddenEntries.size > 0 && (
+                  <button type="button" className="btn" onClick={() => setLegendHiddenEntries(new Set())}>
+                    Restore hidden entries ({legendHiddenEntries.size})
+                  </button>
+                )}
+                {Object.keys(legendLabels).length > 0 && (
+                  <button type="button" className="btn" onClick={() => setLegendLabels({})}>Reset renamed text</button>
+                )}
               </div>
             </div>
           )}
@@ -3587,16 +4591,28 @@ export default function Phylo() {
       <div
         className="canvas-wrap"
         ref={containerRef}
-        onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+        onDragOver={(e) => {
+          // Always cancel so the browser never navigates to a dropped link, but
+          // only OS file drags are accepted (not track rows from the panel).
+          e.preventDefault();
+          if (dragTrackKey.current || !Array.from(e.dataTransfer.types).includes("Files")) {
+            e.dataTransfer.dropEffect = "none";
+            return;
+          }
+          setIsDragOver(true);
+        }}
         onDragLeave={() => setIsDragOver(false)}
         onDrop={(e) => {
           e.preventDefault();
           setIsDragOver(false);
-          const file = e.dataTransfer.files[0];
-          if (!file) return;
-          const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
-          if (["nwk","newick","tree","txt"].includes(ext)) setNewickFile(file);
-          else if (["csv","tsv"].includes(ext)) addAnnotationFile(file);
+          if (dragTrackKey.current) return;
+          // Any mix of files: the first tree file loads the tree, every CSV/TSV is added.
+          const files = Array.from(e.dataTransfer.files);
+          const ext = (f: File) => f.name.split(".").pop()?.toLowerCase() ?? "";
+          const treeFile = files.find(f => ["nwk", "newick", "tree", "treefile", "txt"].includes(ext(f)));
+          const annFiles = files.filter(f => ["csv", "tsv"].includes(ext(f)));
+          if (treeFile) setNewickFile(treeFile);
+          if (annFiles.length) addAnnotationFiles(annFiles);
         }}
       >
         {!tree && (
@@ -3618,6 +4634,38 @@ export default function Phylo() {
           onClick={onClick}
           onDoubleClick={onDoubleClick}
         />
+        {/* Inline rename for legend text (double-click on the canvas legend) */}
+        {legendEdit && legendBoxRef.current && (
+          <div
+            ref={legendEditRef}
+            className="legend-edit"
+            style={{
+              left: legendBoxRef.current.x + legendEdit.hit.x - 4,
+              top: legendBoxRef.current.y + legendEdit.hit.y,
+            }}
+          >
+            <input
+              autoFocus
+              value={legendEdit.value}
+              onChange={(e) => setLegendEdit({ ...legendEdit, value: e.target.value })}
+              onFocus={(e) => e.currentTarget.select()}
+              onBlur={(e) => commitLegendEdit(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); commitLegendEdit(e.currentTarget.value); }
+                else if (e.key === "Escape") { e.preventDefault(); closeLegendEdit(); }
+              }}
+              placeholder={legendEdit.hit.kind === "title" ? "(no title)" : "(default)"}
+              style={{ fontSize: legendFontSize, width: Math.max(140, legendEdit.hit.w + 40) }}
+            />
+            <button
+              type="button"
+              className="btn"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => hideLegendItem(legendEdit.hit)}
+              title="Remove from the legend"
+            >Hide</button>
+          </div>
+        )}
         {/* Clade stats overlay — fixed to bottom-right of canvas so it never shifts sidebar layout */}
         {hoverCladeStats && hoverCladeStats.length > 0 && (
           <div style={{
@@ -3671,6 +4719,26 @@ export default function Phylo() {
             <HexColorPicker
               color={editingSupportSlot === "low" ? supportC0 : editingSupportSlot === "mid" ? supportC1 : supportC2}
               onChange={(c) => { if (editingSupportSlot === "low") setSupportC0(c); else if (editingSupportSlot === "mid") setSupportC1(c); else setSupportC2(c); }}
+            />
+          </div>
+        </>
+      )}
+
+      {/* Colour picker for a group of coloured ranges (from the legend) */}
+      {editingRangeGroup && (
+        <>
+          <div className="modal-backdrop" onClick={() => setEditingRangeGroup(null)} />
+          <div className="modal-content">
+            <div className="modal-header">
+              <span>{ranges[editingRangeGroup[0]]?.label || "Range colour"}</span>
+              <button onClick={() => setEditingRangeGroup(null)} style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 16 }}>×</button>
+            </div>
+            <HexColorPicker
+              color={ranges[editingRangeGroup[0]]?.color ?? "#ffe08a"}
+              onChange={(c) => {
+                const idx = new Set(editingRangeGroup);
+                setRanges(prev => prev.map((r, i) => (idx.has(i) ? { ...r, color: c } : r)));
+              }}
             />
           </div>
         </>
