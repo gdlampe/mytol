@@ -17,4 +17,5 @@ tsconfig.tsbuildinfo
 OLD/
 
 # Claude Code project settings
-.claude/__pycache__/
+.claude/
+__pycache__/
