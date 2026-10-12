@@ -551,3 +551,96 @@ select {
   color: #666;
   user-select: none;
 }
+
+/* ============================================================
+   Ring style editor
+   ============================================================ */
+
+.track-style-box {
+  margin: 0 0 6px 8px;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 6px;
+}
+.style-panel { display: flex; flex-direction: column; gap: 6px; }
+.style-row { display: flex; align-items: center; gap: 6px; }
+.style-row > .note:first-child { min-width: 58px; }
+.gradient-preview {
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+}
+.gradient-chip {
+  display: inline-block;
+  width: 26px;
+  height: 10px;
+  border-radius: 2px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  flex-shrink: 0;
+}
+.category-list { max-height: 180px; overflow-y: auto; }
+.style-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid #eee;
+}
+.style-actions .btn { font-size: 11px; padding: 2px 6px; }
+.btn-danger { color: #b3261e; }
+
+/* Colour picker with eyedropper */
+.color-picker-panel { display: flex; flex-direction: column; gap: 8px; }
+.color-picker-row { display: flex; align-items: center; gap: 4px; position: relative; }
+.color-hex-input { width: 70px; font-family: monospace; text-transform: lowercase; }
+
+/* ============================================================
+   Generic drag-reorder list (legend sections and items)
+   ============================================================ */
+
+.drag-row { position: relative; }
+.drag-row.drop-before::before,
+.drag-row.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: #4e79a7;
+  z-index: 1;
+  pointer-events: none;
+}
+.drag-row.drop-before::before { top: -1px; }
+.drag-row.drop-after::after { bottom: -1px; }
+.drag-handle {
+  cursor: grab;
+  color: #999;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px;
+  border-radius: 3px;
+  user-select: none;
+}
+.drag-handle:hover { color: #333; background: #eee; }
+.drag-handle:active { cursor: grabbing; }
+.drag-handle:focus-visible { outline: 2px solid #4e79a7; }
+
+.legend-sec { border-bottom: 1px solid #eee; padding: 2px 0; background: #f9f9f9; }
+.legend-sec-head { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+.legend-sec-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.legend-sec-toggle { font-size: 11px; padding: 0 5px; }
+.legend-sec-items {
+  margin: 2px 0 4px 18px;
+  max-height: 220px;
+  overflow-y: auto;
+  border-left: 2px solid #e3e3e3;
+  padding-left: 4px;
+}
+.legend-entry-row { display: flex; align-items: center; gap: 4px; font-size: 12px; padding: 1px 0; background: #f9f9f9; }
+.legend-entry-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+/* Colour editing: hide dialogs and dimming while the screen eyedropper samples */
+.eyedropping .modal-backdrop { background: transparent; }
+.eyedropping .modal-content { visibility: hidden; }

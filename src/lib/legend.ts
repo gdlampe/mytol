@@ -19,15 +19,18 @@ export type LegendEntry = {
   color: string;
   /** Swatch fill opacity (coloured ranges are translucent in background mode). */
   fillAlpha: number;
+  /** Draw the swatch as a small gradient (shaded categories: low → category colour). */
+  stops?: GradientStop[];
   edit?: LegendEditTarget;
 };
 
 export type GradientStop = { color: string; opacity: number };
 
+/** note: optional small line under the section title (e.g. scale details). */
 export type LegendSection =
-  | { id: string; title: string; kind: "swatches"; entries: LegendEntry[]; more: number }
-  | { id: string; title: string; kind: "ramp"; min: string; max: string; style: "bar" | "opacity" }
-  | { id: string; title: string; kind: "gradient"; stops: GradientStop[]; labels: [string, string, string]; edits: LegendEditTarget[] };
+  | { id: string; title: string; note?: string; kind: "swatches"; entries: LegendEntry[]; more: number }
+  | { id: string; title: string; note?: string; kind: "ramp"; min: string; max: string; style: "bar" | "gradient"; color: string; stops?: GradientStop[]; ticks?: Array<{ t: number; label: string }> }
+  | { id: string; title: string; note?: string; kind: "gradient"; stops: GradientStop[]; labels: [string, string, string]; edits: LegendEditTarget[] };
 
 export type LegendModel = { title: string; sections: LegendSection[] };
 
@@ -55,7 +58,6 @@ export type MeasureText = (text: string, size: number, bold: boolean) => number;
 
 const TEXT = "#222";
 const MUTED = "#777";
-const RAMP = "#666";
 
 export function legendFont(size: number, bold?: boolean, italic?: boolean): string {
   return `${italic ? "italic " : ""}${bold ? "bold " : ""}${size}px sans-serif`;
@@ -95,9 +97,17 @@ export function layoutLegend(model: LegendModel, style: LegendStyle, measure: Me
       w = Math.max(w, tw);
       y += rowH;
     }
+    if (s.note) {
+      const nfs = Math.round(fs * 0.85);
+      prims.push({ t: "text", x: pad, y: y + nfs * 0.6, text: s.note, size: nfs, fill: MUTED, italic: true });
+      w = Math.max(w, measure(s.note, nfs, false));
+      y += Math.round(nfs * 1.4);
+    }
 
     if (s.kind === "swatches") {
       const n = s.entries.length + (s.more > 0 ? 1 : 0);
+      // Gradient swatches (shaded categories) are drawn twice as wide.
+      const swW = s.entries.some(e => e.stops) ? sw * 2 : sw;
       const perCol = Math.ceil(n / Math.max(1, Math.min(style.columns, n)));
       const cols = Math.ceil(n / perCol); // columns actually filled
       let x = pad;
@@ -110,18 +120,22 @@ export function layoutLegend(model: LegendModel, style: LegendStyle, measure: Me
           const ey = y + r * rowH;
           if (i < s.entries.length) {
             const e = s.entries[i];
-            prims.push({
-              t: "rect", x, y: ey + (rowH - sw) / 2, w: sw, h: sw,
-              fill: e.color, fillOpacity: e.fillAlpha,
-              stroke: e.fillAlpha < 1 ? e.color : "#000", strokeOpacity: e.fillAlpha < 1 ? 1 : 0.35,
-            });
-            hits.push({ kind: "swatch", id: e.id, x, y: ey, w: sw, h: rowH, edit: e.edit });
+            if (e.stops) {
+              prims.push({ t: "lgrad", x, y: ey + (rowH - sw) / 2, w: swW, h: sw, stops: e.stops });
+            } else {
+              prims.push({
+                t: "rect", x, y: ey + (rowH - sw) / 2, w: sw, h: sw,
+                fill: e.color, fillOpacity: e.fillAlpha,
+                stroke: e.fillAlpha < 1 ? e.color : "#000", strokeOpacity: e.fillAlpha < 1 ? 1 : 0.35,
+              });
+            }
+            hits.push({ kind: "swatch", id: e.id, x, y: ey, w: swW, h: rowH, edit: e.edit });
             const tw = measure(e.label, fs, false);
-            prims.push({ t: "text", x: x + sw + gap, y: ey + rowH / 2, text: e.label, size: fs, fill: TEXT });
-            const hit: LegendHit = { kind: "entry", id: e.id, x: x + sw + gap, y: ey, w: tw, h: rowH, text: e.label, edit: e.edit };
+            prims.push({ t: "text", x: x + swW + gap, y: ey + rowH / 2, text: e.label, size: fs, fill: TEXT });
+            const hit: LegendHit = { kind: "entry", id: e.id, x: x + swW + gap, y: ey, w: tw, h: rowH, text: e.label, edit: e.edit };
             hits.push(hit);
             labelHits.push(hit);
-            colW = Math.max(colW, sw + gap + tw);
+            colW = Math.max(colW, swW + gap + tw);
           } else {
             const txt = `… ${s.more} more`;
             prims.push({ t: "text", x, y: ey + rowH / 2, text: txt, size: fs, fill: MUTED, italic: true });
@@ -129,19 +143,45 @@ export function layoutLegend(model: LegendModel, style: LegendStyle, measure: Me
           }
         }
         // Label hit areas span the whole column so short labels are easy to target.
-        for (const h of labelHits) h.w = Math.max(h.w, colW - sw - gap);
+        for (const h of labelHits) h.w = Math.max(h.w, colW - swW - gap);
         x += colW + (c < cols - 1 ? colGap : 0);
       }
       w = Math.max(w, x - pad);
       y += perCol * rowH;
+    } else if (s.kind === "ramp" && s.ticks) {
+      // Log scale: bar on its own row, tick marks + labels (min, powers of the base, max) below.
+      const barW = fs * 9;
+      const by = y + (rowH - barH) / 2;
+      if (s.style === "bar") prims.push({ t: "wedge", x: pad, y: by, w: barW, h: barH, fill: s.color });
+      else prims.push({ t: "lgrad", x: pad, y: by, w: barW, h: barH, stops: s.stops ?? [{ color: s.color, opacity: 1 }] });
+      y += rowH;
+      const lfs = Math.round(fs * 0.85);
+      const cands = [
+        { t: 0, label: s.min }, { t: 1, label: s.max },
+        ...s.ticks.filter(k => k.t > 0.02 && k.t < 0.98),
+      ];
+      // Endpoints first, then interior ticks that don't collide with placed labels.
+      const placed: Array<{ x0: number; x1: number }> = [];
+      for (const c of cands) {
+        const lw = measure(c.label, lfs, false);
+        const cx = pad + c.t * barW;
+        const anchor = c.t <= 0.02 ? "start" : c.t >= 0.98 ? "end" : "middle";
+        const x0 = anchor === "start" ? cx : anchor === "end" ? cx - lw : cx - lw / 2;
+        if (placed.some(p => x0 < p.x1 + gap && x0 + lw > p.x0 - gap)) continue;
+        placed.push({ x0, x1: x0 + lw });
+        prims.push({ t: "rect", x: cx - 0.5, y: by + barH, w: 1, h: Math.round(fs * 0.3), fill: MUTED });
+        prims.push({ t: "text", x: cx, y: y + lfs * 0.6, text: c.label, size: lfs, fill: MUTED, anchor });
+      }
+      y += Math.round(lfs * 1.3);
+      w = Math.max(w, barW);
     } else if (s.kind === "ramp") {
       const barW = fs * 6;
       const minW = measure(s.min, fs, false);
       const by = y + (rowH - barH) / 2;
       prims.push({ t: "text", x: pad, y: y + rowH / 2, text: s.min, size: fs, fill: TEXT });
       const bx = pad + minW + gap;
-      if (s.style === "bar") prims.push({ t: "wedge", x: bx, y: by, w: barW, h: barH, fill: RAMP });
-      else prims.push({ t: "lgrad", x: bx, y: by, w: barW, h: barH, stops: [{ color: "#505050", opacity: 0.1 }, { color: "#505050", opacity: 0.95 }] });
+      if (s.style === "bar") prims.push({ t: "wedge", x: bx, y: by, w: barW, h: barH, fill: s.color });
+      else prims.push({ t: "lgrad", x: bx, y: by, w: barW, h: barH, stops: s.stops ?? [{ color: s.color, opacity: 1 }] });
       const mx = bx + barW + gap;
       prims.push({ t: "text", x: mx, y: y + rowH / 2, text: s.max, size: fs, fill: TEXT });
       w = Math.max(w, mx - pad + measure(s.max, fs, false));
@@ -226,7 +266,9 @@ export function legendToSvg(L: LegendLayout, ox: number, oy: number): string[] {
       const st = p.stroke
         ? ` stroke="${p.stroke}" stroke-width="1"${p.strokeOpacity !== undefined && p.strokeOpacity < 1 ? ` stroke-opacity="${p.strokeOpacity}"` : ""}`
         : "";
-      out.push(`<rect x="${f(p.x + 0.5)}" y="${f(p.y + 0.5)}" width="${f(p.w - 1)}" height="${f(p.h - 1)}" fill="${p.fill}"${fo}${st}/>`);
+      // Stroked rects are inset half a pixel (stroke centred on the edge); plain fills are exact.
+      const ins = p.stroke ? 0.5 : 0;
+      out.push(`<rect x="${f(p.x + ins)}" y="${f(p.y + ins)}" width="${f(p.w - 2 * ins)}" height="${f(p.h - 2 * ins)}" fill="${p.fill}"${fo}${st}/>`);
     } else if (p.t === "text") {
       const attrs = [
         `x="${f(p.x)}"`, `y="${f(p.y)}"`, `font-size="${p.size}"`, `fill="${p.fill}"`, `dominant-baseline="central"`,

@@ -9,7 +9,9 @@ import React, {
 import exampleNewick from "../../example/RTtree.nwk?raw";
 import exampleCsv from "../../example/RTtreelabels.csv?raw";
 import * as d3 from "d3";
-import { HexColorPicker } from "react-colorful";
+import { ColorPickerPanel, Swatch } from "./ColorPicker";
+import DragList, { moveItem } from "./DragList";
+import TrackStylePanel from "./TrackStylePanel";
 
 import {
   MIN_EDGE_PIXELS,
@@ -23,6 +25,7 @@ import type {
   Node,
   Tree,
   AnnotationRow,
+  RingBorder,
   ColoredRange,
   PolarCoord,
   TrackConfig,
@@ -61,7 +64,22 @@ import {
 } from "../lib/annotationFilter";
 import type { AnnotationFilter, NumericOp } from "../lib/annotationFilter";
 import { drawLegend, layoutLegend, legendFont, legendToSvg } from "../lib/legend";
-import type { LegendEditTarget, LegendHit, LegendLayout, LegendModel, LegendSection } from "../lib/legend";
+import type { LegendEditTarget, LegendEntry, LegendHit, LegendLayout, LegendModel, LegendSection } from "../lib/legend";
+import {
+  contStyle,
+  copyStyle,
+  makeGradient,
+  makeTrackPainter,
+  makeValueScale,
+  numericStats,
+  activeShade,
+  pasteCategoryColors,
+  scaleLabel,
+  scaleTicks,
+  logBaseName,
+  DEFAULT_SHADE_LOW,
+} from "../lib/trackStyle";
+import type { Painter, StyleClip } from "../lib/trackStyle";
 
 // ============================================================
 // Categorical colour palettes
@@ -76,8 +94,65 @@ const CATEGORICAL_PALETTES: { name: string; colors: string[] }[] = [
   { name: "Pastel",      colors: ["#fbb4ae","#b3cde3","#ccebc5","#decbe4","#fed9a6","#ffffcc","#e5d8bd","#fddaec","#f2f2f2"] },
 ];
 
+/** Space after a ring (px, before zoom scaling). */
+const trackGap = (t: TrackConfig) => t.gap ?? TRACK_PADDING;
+
+/**
+ * Canvas path for a ring's outline, centred at the origin: two full circles
+ * (full = true) or an annular sector from angle a0 to a1 closed by radial ends.
+ */
+function ringOutlinePath(ctx: CanvasRenderingContext2D, r1: number, r2: number, a0: number, a1: number, full: boolean) {
+  ctx.beginPath();
+  if (full) {
+    ctx.moveTo(r2, 0); ctx.arc(0, 0, r2, 0, 2 * Math.PI);
+    ctx.moveTo(r1, 0); ctx.arc(0, 0, r1, 0, 2 * Math.PI);
+  } else {
+    ctx.moveTo(r2 * Math.cos(a0), r2 * Math.sin(a0));
+    ctx.arc(0, 0, r2, a0, a1, false);
+    ctx.lineTo(r1 * Math.cos(a1), r1 * Math.sin(a1));
+    ctx.arc(0, 0, r1, a1, a0, true);
+    ctx.closePath();
+  }
+}
+
+/** SVG path data for the same outline, centred at (cx, cy) in screen px. */
+function svgRingOutline(cx: number, cy: number, r1: number, r2: number, a0: number, a1: number, full: boolean, f: (n: number) => string): string {
+  const P = (r: number, a: number) => `${f(cx + r * Math.cos(a))},${f(cy + r * Math.sin(a))}`;
+  const circle = (r: number) => `M ${P(r, 0)} A ${f(r)},${f(r)} 0 1,1 ${P(r, Math.PI)} A ${f(r)},${f(r)} 0 1,1 ${P(r, 0)} Z`;
+  if (full) return `${circle(r2)} ${circle(r1)}`;
+  const large = a1 - a0 > Math.PI ? 1 : 0;
+  return `M ${P(r2, a0)} A ${f(r2)},${f(r2)} 0 ${large},1 ${P(r2, a1)} L ${P(r1, a1)} A ${f(r1)},${f(r1)} 0 ${large},0 ${P(r1, a0)} Z`;
+}
+
 /** Longest category list drawn per legend section (the rest collapse to "… N more"). */
 const LEGEND_MAX_ENTRIES = 100;
+/** Longest item list shown per section in the Legend panel. */
+const LEGEND_PANEL_MAX_ITEMS = 300;
+
+/**
+ * Apply a drag within the currently listed ids to a saved order without
+ * forgetting ids that aren't listed right now (hidden categories, absent
+ * sections): only the listed ids are permuted, the rest keep their slots.
+ */
+function mergeMove(prev: string[] | undefined, listed: string[], from: number, to: number): string[] {
+  const merged = [...(prev ?? [])];
+  const seen = new Set(merged);
+  for (const id of listed) if (!seen.has(id)) merged.push(id);
+  const moved = moveItem(listed, from, to);
+  const isListed = new Set(listed);
+  let k = 0;
+  return merged.map(id => (isListed.has(id) ? moved[k++] : id));
+}
+
+/** Sort items by a saved key order; items not in the order keep their relative order after. */
+function applyOrder<T>(items: T[], key: (t: T) => string, order: string[] | undefined): T[] {
+  if (!order || order.length === 0) return items;
+  const rank = new Map(order.map((k, i) => [k, i]));
+  return items
+    .map((it, i) => ({ it, r: rank.get(key(it)) ?? order.length + i }))
+    .sort((a, b) => a.r - b.r)
+    .map(x => x.it);
+}
 
 /**
  * Integer input that can be typed into freely: in-range values apply as you
@@ -195,7 +270,18 @@ export default function Phylo() {
   const [annSearchInvert, setAnnSearchInvert] = useState(false);
   const [annHighlight, setAnnHighlight] = useState(true);
   const [annHighlightColor, setAnnHighlightColor] = useState("#e6007e");
+  const [annDotSize, setAnnDotSize] = useState(3.5); // dot radius, px
   const [annMatchCursor, setAnnMatchCursor] = useState(-1);
+
+  // ------------ Annotation columns: deletion, style clipboard, colour editing ------------
+
+  /** Columns removed by the user (ignored when merging annotation files). */
+  const [deletedColumns, setDeletedColumns] = useState<Set<string>>(() => new Set());
+  const [styleClip, setStyleClip] = useState<StyleClip | null>(null);
+  const [annExportFormat, setAnnExportFormat] = useState<"tsv" | "csv">("tsv");
+  const [annExportVisibleOnly, setAnnExportVisibleOnly] = useState(false);
+  /** Generic colour editor (gradient stops, bar colours, shade lows …). */
+  const [colorEdit, setColorEdit] = useState<{ title: string; color: string; apply: (c: string) => void } | null>(null);
 
   // ------------ On-canvas legend ------------
 
@@ -213,6 +299,11 @@ export default function Phylo() {
   /** Legend-only text overrides keyed by section/entry id (data is untouched). */
   const [legendLabels, setLegendLabels] = useState<Record<string, string>>({});
   const [legendEdit, setLegendEdit] = useState<{ hit: LegendHit; value: string } | null>(null);
+  /** Legend section order (ids); sections not listed follow in ring order. */
+  const [legendOrder, setLegendOrder] = useState<string[]>([]);
+  /** Per-section entry order (entry ids); entries not listed keep their default order after. */
+  const [legendEntryOrder, setLegendEntryOrder] = useState<Record<string, string[]>>({});
+  const [legendExpanded, setLegendExpanded] = useState<Set<string>>(() => new Set());
   const [editingRangeGroup, setEditingRangeGroup] = useState<number[] | null>(null);
 
   // ------------ Layout / view state ------------
@@ -230,7 +321,8 @@ export default function Phylo() {
   const [activeRangeColor, setActiveRangeColor] = useState("#ffe08a");
   const [activeRangeLabel, setActiveRangeLabel] = useState("");
   const [showRangePanel, setShowRangePanel] = useState(false);
-  const [rangeColorTrackKey, setRangeColorTrackKey] = useState<string | null>(null);
+  // undefined = not chosen yet (defaults to the first categorical ring); null = Manual.
+  const [rangeColorTrackKey, setRangeColorTrackKey] = useState<string | null | undefined>(undefined);
   const [editingRangeIndex, setEditingRangeIndex] = useState<number | null>(
     null
   );
@@ -337,6 +429,10 @@ export default function Phylo() {
   const remapCollapsedRef = useRef<string[]>([]);
   const remapRangesRef = useRef<Array<{ fp: string; color: string; label?: string }>>([]);
   const remapPendingRef = useRef(false);
+  // Style of deleted columns, reapplied if they are restored.
+  const deletedStyleStash = useRef(new Map<string, { track: TrackConfig; colors: Map<string, string> | undefined }>());
+  // Selected node to restore (by fingerprint) once a loaded session's tree is built.
+  const pendingSelectRef = useRef<string | null>(null);
 
   // ==========================================================
   // Derived layouts (memoised)
@@ -429,6 +525,15 @@ export default function Phylo() {
     setShowRangePanel(false);
   }, [hiddenLeafNames]);
 
+  // Restore a session's selection after its tree is built. Declared after the
+  // effect above so it wins over that effect's selection reset.
+  useEffect(() => {
+    if (!tree || pendingSelectRef.current === null) return;
+    const id = fingerprintToNode(tree, pendingSelectRef.current);
+    pendingSelectRef.current = null;
+    if (id !== null) setSelectedNode(id);
+  }, [tree]);
+
   // Annotations: derive merged annotation map + track configs + colour maps
   // from the list of loaded files. Multiple files stack (later files overwrite
   // overlapping cells per id). User customisations on existing tracks/colours
@@ -443,6 +548,10 @@ export default function Phylo() {
         else map.set(r.id, { ...r });
       }
     }
+    // Columns the user deleted are dropped from the merged rows entirely.
+    if (deletedColumns.size > 0) {
+      for (const row of map.values()) for (const c of deletedColumns) delete row[c];
+    }
     setAnnotations(map);
 
     // Ordered union of columns across files (insertion order = load order).
@@ -450,7 +559,7 @@ export default function Phylo() {
     const seenCols = new Set<string>();
     for (const f of annotationFiles) {
       for (const c of f.columns) {
-        if (!seenCols.has(c)) { seenCols.add(c); allColumns.push(c); }
+        if (!seenCols.has(c) && !deletedColumns.has(c)) { seenCols.add(c); allColumns.push(c); }
       }
     }
 
@@ -476,6 +585,10 @@ export default function Phylo() {
       colMeta.set(col, { isContinuous, maxVal: maxVal > 0 ? maxVal : 1, cats });
     }
 
+    // Styles of deleted columns that are being restored (snapshot: the
+    // updaters below run later, after the stash is pruned at the end).
+    const restoring = new Map([...deletedStyleStash.current].filter(([k]) => !deletedColumns.has(k)));
+
     setTrackConfig(prev => {
       const prevByKey = new Map(prev.map(t => [t.key, t]));
       // Keep the user's ring order for existing columns; new columns go last, in file order.
@@ -485,11 +598,20 @@ export default function Phylo() {
       ];
       return ordered.map(col => {
         const meta = colMeta.get(col)!;
-        const existing = prevByKey.get(col);
+        const existing = prevByKey.get(col) ?? restoring.get(col)?.track;
         const desiredType = meta.isContinuous ? "continuous" : "categorical";
-        if (existing && existing.type === desiredType) {
+        // Keep the existing ring (including a user's switch to categorical);
+        // only force categorical when a continuous column gains text values.
+        if (existing) {
           if (existing.type === "continuous") {
-            return { ...existing, maxVal: Math.max(existing.maxVal ?? 1, meta.maxVal) };
+            return desiredType === "continuous"
+              ? { ...existing, maxVal: Math.max(existing.maxVal ?? 1, meta.maxVal) }
+              : { ...existing, type: "categorical" as const };
+          }
+          // Categorical stays categorical if the user chose it; an automatic
+          // one reverts to continuous once the column is all numeric again.
+          if (desiredType === "continuous" && !existing.userType) {
+            return { ...existing, type: "continuous" as const, maxVal: meta.maxVal };
           }
           return existing;
         }
@@ -504,8 +626,9 @@ export default function Phylo() {
       const next = new Map<string, Map<string, string>>();
       for (const col of allColumns) {
         const meta = colMeta.get(col)!;
-        if (meta.isContinuous) continue;
-        const old = prev.get(col);
+        const old = prev.get(col) ?? restoring.get(col)?.colors;
+        // Numeric columns get colours only if the user made them categorical.
+        if (meta.isContinuous && !old) continue;
         const colorMap = new Map<string, string>();
         for (const cat of meta.cats) {
           colorMap.set(cat, old?.get(cat) ?? originalCategoryColor(cat));
@@ -518,17 +641,25 @@ export default function Phylo() {
     // Clear legend/colour-editor selections if their column went away.
     setShowLegendKey(prev => (prev && seenCols.has(prev) ? prev : null));
     setEditingColor(prev => (prev && seenCols.has(prev.trackKey) ? prev : null));
+    // Keep the user's choice (including Manual) while its column exists;
+    // otherwise default to the first categorical column.
     setRangeColorTrackKey(prev => {
-      if (prev && seenCols.has(prev)) {
-        const meta = colMeta.get(prev);
-        if (meta && !meta.isContinuous) return prev;
-      }
-      for (const col of allColumns) {
-        if (!colMeta.get(col)!.isContinuous) return col;
-      }
-      return null;
+      if (prev === null || (prev !== undefined && seenCols.has(prev))) return prev;
+      return allColumns.find(c => !colMeta.get(c)!.isContinuous) ?? undefined;
     });
-  }, [annotationFiles]);
+
+    // Each stashed style is used once: drop entries for columns now restored.
+    for (const k of [...deletedStyleStash.current.keys()]) {
+      if (!deletedColumns.has(k)) deletedStyleStash.current.delete(k);
+    }
+  }, [annotationFiles, deletedColumns]);
+
+  // Deleting stashes the ring's style so "Restore" brings it back as it was.
+  const deleteColumn = (key: string) => {
+    const t = trackConfig.find(c => c.key === key);
+    if (t) deletedStyleStash.current.set(key, { track: t, colors: colorMaps.get(key) });
+    setDeletedColumns(prev => new Set(prev).add(key));
+  };
 
   // Append annotation files. Parses them in parallel, then pushes the ones that
   // parsed onto the file list in the order given (one update) — the effect
@@ -553,19 +684,21 @@ export default function Phylo() {
 
   const annSearchTrack = trackConfig.find(t => t.key === annSearchKey) ?? null;
 
-  // Keep the chosen column valid as annotation files come and go.
-  useEffect(() => {
-    if (annSearchKey !== null && trackConfig.some(t => t.key === annSearchKey)) return;
-    setAnnSearchKey(trackConfig[0]?.key ?? null);
-  }, [trackConfig, annSearchKey]);
-
-  // A new column starts with a blank query.
-  useEffect(() => {
+  // Switching column starts a blank query. (Done here rather than in an effect
+  // on annSearchKey so a session load can restore key and query together.)
+  const chooseAnnSearchKey = (key: string | null) => {
+    setAnnSearchKey(key);
     setAnnSearchValues(new Set());
     setAnnSearchValueFilter("");
     setAnnSearchA("");
     setAnnSearchB("");
-  }, [annSearchKey]);
+  };
+
+  // Keep the chosen column valid as annotation files come and go.
+  useEffect(() => {
+    if (annSearchKey !== null && trackConfig.some(t => t.key === annSearchKey)) return;
+    chooseAnnSearchKey(trackConfig[0]?.key ?? null);
+  }, [trackConfig, annSearchKey]);
 
   // Distinct values (with leaf counts) of a categorical column among the tree's
   // leaves; only computed while the search section is open.
@@ -730,43 +863,73 @@ export default function Phylo() {
 
   const treeHasSupport = useMemo(() => !!tree && tree.nodes.some(n => n.support !== undefined), [tree]);
 
-  const legendModel = useMemo((): LegendModel | null => {
-    if (!tree || !legendShow) return null;
+  // Numeric stats for every column (drive value scales) and one painter per
+  // ring — shared by all canvas and SVG renderers and by the legend.
+  // Sorted: reordering rings must not trigger a full re-scan of the rows.
+  const trackKeysSig = trackConfig.map(t => t.key).sort().join("\x00");
+  const numStats = useMemo(
+    () => numericStats(annotations.values(), trackKeysSig ? trackKeysSig.split("\x00") : []),
+    [annotations, trackKeysSig]
+  );
+  const trackPainters = useMemo(() => {
+    const m = new Map<string, Painter>();
+    for (const t of trackConfig) m.set(t.key, makeTrackPainter(t, colorMaps.get(t.key), numStats));
+    return m;
+  }, [trackConfig, colorMaps, numStats]);
+
+  // Every possible legend section with all of its entries, in the user's
+  // order (legendOrder / legendEntryOrder). Exclusion, hidden entries and the
+  // entry cap are applied afterwards in legendModel; the panel lists this.
+  const legendCatalog = useMemo((): LegendSection[] => {
+    if (!tree) return [];
     const text = (id: string, fallback: string) => legendLabels[id] ?? fallback;
     const sections: LegendSection[] = [];
+    const colLabel = (key: string) => trackConfig.find(t => t.key === key)?.label ?? key;
 
-    // One section per visible annotation ring, in ring order.
+    // One section per visible annotation ring.
     if (showTracks) {
       for (const t of trackConfig) {
         if (!t.visible) continue;
         const sid = `track:${t.key}`;
-        if (legendExcluded.has(sid)) continue;
         if (t.type === "categorical") {
           const cmap = colorMaps.get(t.key);
           if (!cmap) continue;
           const present = legendOnlyPresent ? presentCategories.get(t.key) : undefined;
-          const shown = [...cmap].filter(([cat]) =>
-            (!present || present.has(cat)) && !legendHiddenEntries.has(`${sid}\x00${cat}`)
-          );
-          const entries = shown.slice(0, LEGEND_MAX_ENTRIES).map(([cat, color]) => {
-            const id = `${sid}\x00${cat}`;
-            const edit: LegendEditTarget = { type: "category", trackKey: t.key, category: cat };
-            return { id, label: text(id, cat), color, fillAlpha: 1, edit };
-          });
-          if (entries.length) {
-            sections.push({ id: sid, title: t.label, kind: "swatches", entries, more: shown.length - entries.length });
+          const shade = activeShade(t, numStats);
+          let note: string | undefined;
+          if (shade) {
+            const sc = makeValueScale(shade, numStats.get(shade.by));
+            const { lo, hi } = scaleLabel(sc);
+            note = `shaded by ${colLabel(shade.by)}: ${lo} – ${hi}${sc.log ? ` (${logBaseName(sc.base)})` : ""}`;
           }
+          const entries: LegendEntry[] = [...cmap]
+            .filter(([cat]) => !present || present.has(cat))
+            .map(([cat, color]) => {
+              const id = `${sid}\x00${cat}`;
+              const edit: LegendEditTarget = { type: "category", trackKey: t.key, category: cat };
+              const stops = shade
+                ? [{ color: shade.low[cat] ?? DEFAULT_SHADE_LOW, opacity: 1 }, { color, opacity: 1 }]
+                : undefined;
+              return { id, label: text(id, cat), color, fillAlpha: 1, stops, edit };
+            });
+          sections.push({ id: sid, title: t.label, note, kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder[sid]), more: 0 });
         } else {
+          const cs = contStyle(t);
+          const sc = makeValueScale(cs, numStats.get(t.key));
+          const { lo, hi } = scaleLabel(sc);
           sections.push({
-            id: sid, title: t.label, kind: "ramp", min: "0", max: String(+(t.maxVal ?? 1).toPrecision(4)),
-            style: layout === "unrooted" ? "opacity" : "bar",
+            id: sid, title: t.label, kind: "ramp", min: lo, max: hi,
+            style: cs.mode, color: cs.barColor,
+            stops: cs.mode === "gradient" ? cs.stops.map(color => ({ color, opacity: 1 })) : undefined,
+            note: sc.log ? `${logBaseName(sc.base)} scale` : undefined,
+            ticks: scaleTicks(sc),
           });
         }
       }
     }
 
     // Coloured ranges, merged by label + colour.
-    if (ranges.length > 0 && !legendExcluded.has("ranges")) {
+    if (ranges.length > 0) {
       const groups = new Map<string, { label: string; color: string; indices: number[] }>();
       ranges.forEach((r, i) => {
         const label = r.label || `Node ${r.nodeId}`;
@@ -775,14 +938,14 @@ export default function Phylo() {
         if (g) g.indices.push(i);
         else groups.set(key, { label, color: r.color, indices: [i] });
       });
-      const entries = [...groups].map(([key, g]) => {
+      const entries: LegendEntry[] = [...groups].map(([key, g]) => {
         const edit: LegendEditTarget = { type: "ranges", indices: g.indices };
-        return { id: `ranges\x00${key}`, label: g.label, color: g.color, fillAlpha: rangeDisplayMode === "background" ? 0.33 : 1, edit };
-      }).filter(e => !legendHiddenEntries.has(e.id));
-      if (entries.length) sections.push({ id: "ranges", title: text("ranges", "Coloured ranges"), kind: "swatches", entries, more: 0 });
+        return { id: rangeEntryId(g.label, g.color), label: g.label, color: g.color, fillAlpha: rangeDisplayMode === "background" ? 0.33 : 1, edit };
+      });
+      sections.push({ id: "ranges", title: text("ranges", "Coloured ranges"), kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder["ranges"]), more: 0 });
     }
 
-    if (optSupportColouring && treeHasSupport && !legendExcluded.has("support")) {
+    if (optSupportColouring && treeHasSupport) {
       const fmt = (v: number) => (supportAsPercent ? v.toFixed(0) : String(+v.toFixed(2)));
       sections.push({
         id: "support", title: text("support", "Branch support"), kind: "gradient",
@@ -792,14 +955,29 @@ export default function Phylo() {
       });
     }
 
-    return { title: legendTitle, sections };
+    return applyOrder(sections, sec => sec.id, legendOrder);
   }, [
-    tree, legendShow, legendLabels, legendTitle, legendExcluded, legendHiddenEntries, legendOnlyPresent,
-    showTracks, trackConfig, colorMaps, presentCategories, layout,
+    tree, legendLabels, legendOnlyPresent, legendOrder, legendEntryOrder,
+    showTracks, trackConfig, colorMaps, presentCategories, numStats,
     ranges, rangeDisplayMode,
     optSupportColouring, treeHasSupport, supportAsPercent,
     supportC0, supportC1, supportC2, supportV0, supportV1, supportV2,
   ]);
+
+  // What the legend actually draws: included sections, visible entries, capped.
+  const legendModel = useMemo((): LegendModel | null => {
+    if (!tree || !legendShow) return null;
+    const sections: LegendSection[] = [];
+    for (const sec of legendCatalog) {
+      if (legendExcluded.has(sec.id)) continue;
+      if (sec.kind !== "swatches") { sections.push(sec); continue; }
+      const shown = sec.entries.filter(e => !legendHiddenEntries.has(e.id));
+      if (!shown.length) continue;
+      const entries = shown.slice(0, LEGEND_MAX_ENTRIES);
+      sections.push({ ...sec, entries, more: shown.length - entries.length });
+    }
+    return { title: legendTitle, sections };
+  }, [tree, legendShow, legendCatalog, legendExcluded, legendHiddenEntries, legendTitle]);
 
   // ==========================================================
   // Colouring helpers
@@ -822,7 +1000,7 @@ export default function Phylo() {
     if (!showTracks) return 0;
     return d3.sum(
       trackConfig.filter((t) => t.visible),
-      (t) => t.height + TRACK_PADDING
+      (t) => t.height + trackGap(t)
     );
   }, [trackConfig, showTracks]);
 
@@ -1576,54 +1754,55 @@ export default function Phylo() {
             worldXMax + worldCullMargin, worldYMax + worldCullMargin
           );
 
+          const ringBorders: Array<{ r1: number; r2: number; border: RingBorder }> = [];
           for (const track of trackConfig) {
             if (!track.visible) continue;
             const r1 = currentR, r2 = r1 + track.height * k;
-            currentR += (track.height + TRACK_PADDING) * k;
+            currentR += (track.height + trackGap(track)) * k;
             if (r2 < win.rMin || r1 > win.rMax) continue;
+            if (track.border?.show) ringBorders.push({ r1, r2, border: track.border });
             const arcPx = r1 * arcPerLeaf * gZoom;
             const leafStep = Math.max(1, Math.floor(optLodMinPx / Math.max(arcPx, 1e-9)));
 
             // Batch arc segments by colour — one fill() per distinct colour
-            const colorSegs = new Map<string, Array<[number, number]>>();
+            const paint = trackPainters.get(track.key);
+            if (!paint) continue;
+            const colorSegs = new Map<string, Array<[number, number, number]>>();
             for (let i = 0; i < sortedLeafIds.length; i += leafStep) {
               const leafIdA = sortedLeafIds[i];
               const leafIdB = sortedLeafIds[(i + leafStep) % sortedLeafIds.length];
-              const nd = nodes[leafIdA];
-              const row = annotations.get(nd.name || "");
-              const val = row ? row[track.key] : undefined;
-              if (val === null || val === undefined || val === "") continue;
-
-              let color: string;
-              if (track.type === "categorical") {
-                color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa";
-              } else {
-                const num = Number(val);
-                if (isNaN(num)) continue;
-                const t = Math.min(1, Math.max(0, num / (track.maxVal || 1)));
-                color = `rgba(80,80,80,${(0.1 + t * 0.85).toFixed(2)})`;
-              }
+              const cell = paint(annotations.get(nodes[leafIdA].name || ""));
+              if (!cell) continue;
 
               const a1 = coords[leafIdA].angle;
               const a2raw = coords[leafIdB].angle;
               const a2 = a2raw > a1 ? a2raw : a2raw + 2 * Math.PI;
               if (!arcInWindow(a1, a2, win)) continue;
 
-              if (!colorSegs.has(color)) colorSegs.set(color, []);
-              colorSegs.get(color)!.push([a1, a2]);
+              // Bars grow outward from the ring's inner edge.
+              const rOut = r1 + cell.frac * (r2 - r1);
+              if (!colorSegs.has(cell.color)) colorSegs.set(cell.color, []);
+              colorSegs.get(cell.color)!.push([a1, a2, rOut]);
             }
 
             for (const [color, segs] of colorSegs) {
               ctx.fillStyle = color;
               ctx.beginPath();
-              for (const [a1, a2] of segs) {
-                ctx.moveTo(r2 * Math.cos(a1), r2 * Math.sin(a1));
-                ctx.arc(0, 0, r2, a1, a2, false);
+              for (const [a1, a2, rOut] of segs) {
+                ctx.moveTo(rOut * Math.cos(a1), rOut * Math.sin(a1));
+                ctx.arc(0, 0, rOut, a1, a2, false);
                 ctx.arc(0, 0, r1, a2, a1, true);
                 ctx.closePath();
               }
               ctx.fill();
             }
+          }
+          // Ring borders: full circles at each bordered ring's inner and outer edge.
+          for (const { r1, r2, border } of ringBorders) {
+            ringOutlinePath(ctx, r1, r2, 0, 0, true);
+            ctx.lineWidth = border.width * k;
+            ctx.strokeStyle = border.color;
+            ctx.stroke();
           }
         }
       }
@@ -1740,24 +1919,18 @@ export default function Phylo() {
         for (const track of trackConfig) {
           if (!track.visible) continue;
           const r1 = currentR, r2 = r1 + track.height * trackPx;
-          currentR += (track.height + TRACK_PADDING) * trackPx;
+          currentR += (track.height + trackGap(track)) * trackPx;
           if (r2 < win.rMin || r1 > win.rMax) continue;
+          const paint = trackPainters.get(track.key);
+          if (!paint) continue;
           const colorSegs = new Map<string, Array<[number, number, number]>>();
           for (const { lo, hi, row } of cells) {
-            const val = row ? row[track.key] : undefined;
-            if (val === null || val === undefined || val === "") continue;
-            let color: string, rOut = r2;
-            if (track.type === "categorical") {
-              color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa";
-            } else {
-              // Continuous: bar grows outward from the inner edge.
-              const num = Number(val);
-              if (isNaN(num)) continue;
-              rOut = r1 + Math.min(1, Math.max(0, num / (track.maxVal || 1))) * (r2 - r1);
-              color = "#666";
-            }
-            if (!colorSegs.has(color)) colorSegs.set(color, []);
-            colorSegs.get(color)!.push([lo, hi, rOut]);
+            const cell = paint(row);
+            if (!cell) continue;
+            // Bars grow outward from the ring's inner edge.
+            const rOut = r1 + cell.frac * (r2 - r1);
+            if (!colorSegs.has(cell.color)) colorSegs.set(cell.color, []);
+            colorSegs.get(cell.color)!.push([lo, hi, rOut]);
           }
           for (const [color, segs] of colorSegs) {
             ctx.fillStyle = color;
@@ -1770,6 +1943,26 @@ export default function Phylo() {
             }
             ctx.fill();
           }
+        }
+        ctx.restore();
+      }
+
+      // Ring borders: outline of each bordered ring along the tree's arc
+      // (drawn even when no cells are in view, e.g. zoomed into an empty stretch).
+      if (trackConfig.some(t => t.visible && t.border?.show) && trackOuterR_screen >= win.rMin && trackStartR_screen <= win.rMax) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        const startRad = (rotation * Math.PI) / 180;
+        let currentR = trackStartR_screen;
+        for (const track of trackConfig) {
+          if (!track.visible) continue;
+          const r1 = currentR, r2 = r1 + track.height * trackPx;
+          currentR += (track.height + trackGap(track)) * trackPx;
+          if (!track.border?.show || r2 < win.rMin || r1 > win.rMax) continue;
+          ringOutlinePath(ctx, r1, r2, startRad - arcRad, startRad, arc >= 360);
+          ctx.lineWidth = track.border.width * trackPx;
+          ctx.strokeStyle = track.border.color;
+          ctx.stroke();
         }
         ctx.restore();
       }
@@ -1797,21 +1990,32 @@ export default function Phylo() {
           let currentX = overlayTrackX;
           for (const track of trackConfig) {
             if (!track.visible) continue;
-            const val = row ? row[track.key] : undefined;
-            if (val === null || val === undefined || val === "") { currentX += track.height + TRACK_PADDING; continue; }
-            if (track.type === "categorical") {
-              const color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa";
-              ctx.fillStyle = color;
-              ctx.fillRect(currentX, screenY - cellH / 2, track.height, cellH);
-            } else {
-              const num = Number(val);
-              if (!isNaN(num)) {
-                const barW = (num / (track.maxVal || 1)) * track.height;
-                ctx.fillStyle = "#666";
-                ctx.fillRect(currentX, screenY - cellH / 2, barW, cellH);
+            const cell = trackPainters.get(track.key)?.(row);
+            if (cell) {
+              ctx.fillStyle = cell.color;
+              ctx.fillRect(currentX, screenY - cellH / 2, cell.frac * track.height, cellH);
+            }
+            currentX += track.height + trackGap(track);
+          }
+        }
+
+        // Ring borders: a box around each bordered ring's column, over all leaf rows.
+        if (trackConfig.some(t => t.visible && t.border?.show)) {
+          const rowY = (i: number) => H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
+          let currentX = overlayTrackX;
+          for (const track of trackConfig) {
+            if (!track.visible) continue;
+            if (track.border?.show) {
+              const bw = track.border.width;
+              const y0 = Math.max(rowY(0) - leafSpacingPx / 2, -bw);
+              const y1 = Math.min(rowY(leaves.length - 1) + leafSpacingPx / 2, H + bw);
+              if (y1 > y0) {
+                ctx.lineWidth = bw;
+                ctx.strokeStyle = track.border.color;
+                ctx.strokeRect(currentX, y0, track.height, y1 - y0);
               }
             }
-            currentX += track.height + TRACK_PADDING;
+            currentX += track.height + trackGap(track);
           }
         }
       }
@@ -1911,8 +2115,8 @@ export default function Phylo() {
       const Rc = Math.min(W, H) * CIRC_RADIUS_FRACTION;
       const Ru = unrootedLayout ? Rc / (unrootedLayout.maxR || 1) : 0;
       const arcRad = (arc * Math.PI) / 180;
-      const dotR = 3.5;
-      const cell = 5;
+      const dotR = annDotSize;
+      const cell = Math.max(2, dotR * 1.4); // thinning grid ≈ one dot wide
       const gw = Math.ceil(W / cell) + 2, gh = Math.ceil(H / cell) + 2;
       const grid = new Uint8Array(gw * gh);
       let drawn = 0;
@@ -2038,8 +2242,8 @@ export default function Phylo() {
     optFontScale, optLodMinPx, nodeWidthPx, optBarFill,
     optBackground, optShowSupportLabels, optSupportColouring,
     rangeDisplayMode,
-    tracksZoomWithTree,
-    annMatches, annHighlight, annHighlightColor, annStepTargets,
+    tracksZoomWithTree, trackPainters,
+    annMatches, annHighlight, annHighlightColor, annStepTargets, annDotSize,
     legendModel, legendPos, legendFontSize, legendColumns, legendBox,
   ]);
 
@@ -2678,6 +2882,26 @@ export default function Phylo() {
   // Legend editing
   // ==========================================================
 
+  // Range legend entries are keyed by label + colour; when either changes,
+  // carry the entry's saved position and hidden state over to its new id.
+  const rangeEntryId = (label: string, color: string) => `ranges\x00${label}\x00${color}`;
+  const renameRangeEntry = (oldId: string, newId: string) => {
+    if (oldId === newId) return;
+    setLegendEntryOrder(prev => {
+      const order = prev["ranges"];
+      if (!order || !order.includes(oldId)) return prev;
+      const next = order.filter(id => id !== newId).map(id => (id === oldId ? newId : id));
+      return { ...prev, ranges: next };
+    });
+    setLegendHiddenEntries(prev => {
+      if (!prev.has(oldId)) return prev;
+      const next = new Set(prev);
+      next.delete(oldId);
+      next.add(newId);
+      return next;
+    });
+  };
+
   const openLegendEdit = (hit: LegendHit) => {
     legendEditClosed.current = false;
     setLegendEdit({ hit, value: hit.text ?? "" });
@@ -2717,6 +2941,8 @@ export default function Phylo() {
       if (hit.edit?.type === "ranges") {
         // Range labels are user data already, so rename the ranges themselves.
         const idx = new Set(hit.edit.indices);
+        const r0 = ranges[hit.edit.indices[0]];
+        if (r0) renameRangeEntry(rangeEntryId(r0.label || `Node ${r0.nodeId}`, r0.color), rangeEntryId(v || `Node ${r0.nodeId}`, r0.color));
         setRanges(prev => prev.map((r, i) => (idx.has(i) ? { ...r, label: v } : r)));
       } else {
         setOverride(hit.id);
@@ -2739,22 +2965,65 @@ export default function Phylo() {
       return next;
     });
 
-  // Sections the legend can show, for the panel checklist.
-  const legendSectionChoices: Array<{ id: string; label: string }> = [
-    ...(showTracks ? trackConfig.filter(t => t.visible).map(t => ({ id: `track:${t.key}`, label: t.label })) : []),
-    ...(ranges.length > 0 ? [{ id: "ranges", label: legendLabels["ranges"] ?? "Coloured ranges" }] : []),
-    ...(optSupportColouring && treeHasSupport ? [{ id: "support", label: legendLabels["support"] ?? "Branch support" }] : []),
-  ];
 
   const updateTrack = (index: number, key: "type" | "height" | "visible" | "label", value: any) => {
     const newConfig = [...trackConfig];
     const track = { ...newConfig[index] };
-    if (key === "type") track.type = value;
+    if (key === "type") { track.type = value; track.userType = true; }
     if (key === "height") track.height = clamp(Number(value) || 0, 1, 100);
     if (key === "visible") track.visible = !!value;
     if (key === "label") track.label = String(value);
     newConfig[index] = track;
     setTrackConfig(newConfig);
+    // A column switched to categorical needs colours for its values.
+    if (key === "type" && value === "categorical" && !colorMaps.has(track.key)) {
+      const cmap = new Map<string, string>();
+      for (const row of annotations.values()) {
+        const v = cellValue(row, track.key);
+        if (v !== "" && !cmap.has(v)) cmap.set(v, originalCategoryColor(v));
+      }
+      setColorMaps(prev => new Map(prev).set(track.key, cmap));
+    }
+  };
+
+  const patchTrack = (key: string, patch: Partial<TrackConfig>) =>
+    setTrackConfig(prev => prev.map(t => (t.key === key ? { ...t, ...patch } : t)));
+
+  // Columns with numeric values (for "shade by").
+  const numericColumns = trackConfig
+    .filter(t => (numStats.get(t.key)?.count ?? 0) > 0)
+    .map(t => ({ key: t.key, label: t.label }));
+
+  // Paste a copied ring style. Categorical: colours by category name, then the
+  // remaining source colours in order; shading (scale + low colours) comes too.
+  // Continuous: display mode, colours and scale type (this ring keeps its min/max).
+  const pasteStyleTo = (t: TrackConfig) => {
+    const clip = styleClip;
+    if (!clip || clip.type !== t.type) return;
+    if (t.type === "categorical") {
+      const target = colorMaps.get(t.key);
+      if (!target) return;
+      setColorMaps(prev => new Map(prev).set(t.key, pasteCategoryColors(clip, target)));
+      let shade = null;
+      if (clip.shade) {
+        // Dense low map over the source categories (unset = white), so one custom
+        // low colour doesn't spill onto categories that were white in the source.
+        const lows = pasteCategoryColors(
+          { ...clip, colors: clip.colors.map(([cat]) => [cat, clip.shade!.low[cat] ?? DEFAULT_SHADE_LOW] as [string, string]) },
+          new Map([...target.keys()].map(k => [k, DEFAULT_SHADE_LOW]))
+        );
+        const byOk = trackConfig.some(c => c.key === clip.shade!.by && c.key !== t.key);
+        shade = { ...clip.shade, by: byOk ? clip.shade.by : (t.shade?.by ?? ""), low: Object.fromEntries(lows) };
+        if (!shade.by) shade = null;
+      }
+      patchTrack(t.key, { shade, border: clip.border ? { ...clip.border } : undefined, gap: clip.gap });
+    } else if (clip.cont) {
+      const cur = contStyle(t);
+      patchTrack(t.key, {
+        cont: { ...clip.cont, stops: [...clip.cont.stops], min: cur.min, max: cur.max },
+        border: clip.border ? { ...clip.border } : undefined, gap: clip.gap,
+      });
+    }
   };
 
   const handleColorChange = (newColor: string) => {
@@ -2921,17 +3190,21 @@ export default function Phylo() {
             if (skipNode[leafId] === 2) continue;
             const sY = H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
             if (sY + cellH / 2 < 0 || sY - cellH / 2 > H) continue;
-            const row = annotations.get(tree.nodes[leafId].name || "");
-            const val = row ? row[track.key] : undefined;
-            if (val === null || val === undefined || val === "") continue;
-            let color: string, w: number;
-            if (track.type === "categorical") { color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa"; w = track.height; }
-            else { const n = Number(val); if (isNaN(n)) continue; color = "#666"; w = (n / (track.maxVal || 1)) * track.height; }
-            if (!cRects.has(color)) cRects.set(color, []);
-            cRects.get(color)!.push(`M ${f(currentX)},${f(sY - cellH / 2)} h ${f(w)} v ${f(cellH)} h ${f(-w)} Z`);
+            const cell = trackPainters.get(track.key)?.(annotations.get(tree.nodes[leafId].name || ""));
+            if (!cell) continue;
+            const w = cell.frac * track.height;
+            if (!cRects.has(cell.color)) cRects.set(cell.color, []);
+            cRects.get(cell.color)!.push(`M ${f(currentX)},${f(sY - cellH / 2)} h ${f(w)} v ${f(cellH)} h ${f(-w)} Z`);
           }
           for (const [color, paths] of cRects) lines.push(`<path fill="${color}" d="${paths.join(" ")}"/>`);
-          currentX += track.height + TRACK_PADDING;
+          if (track.border?.show) {
+            const bw = track.border.width;
+            const rowY = (i: number) => H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
+            const y0 = Math.max(rowY(0) - leafSpacingPx / 2, -bw);
+            const y1 = Math.min(rowY(tree.leaves.length - 1) + leafSpacingPx / 2, H + bw);
+            if (y1 > y0) lines.push(`<rect x="${f(currentX)}" y="${f(y0)}" width="${f(track.height)}" height="${f(y1 - y0)}" fill="none" stroke="${track.border.color}" stroke-width="${f(bw)}"/>`);
+          }
+          currentX += track.height + trackGap(track);
         }
         lines.push('</g>');
       }
@@ -3034,14 +3307,17 @@ export default function Phylo() {
         for (const track of trackConfig) {
           if (!track.visible) continue;
           const r1s = curS, r2s = curS + track.height * trackPx;
-          curS += (track.height + TRACK_PADDING) * trackPx;
+          curS += (track.height + trackGap(track)) * trackPx;
+          if (track.border?.show) {
+            const startRad = (rotation * Math.PI) / 180;
+            lines.push(`<path fill="none" stroke="${track.border.color}" stroke-width="${f(track.border.width * trackPx)}" d="${svgRingOutline(cx, cy, r1s, r2s, startRad - arcRad, startRad, arcDeg >= 360, f)}"/>`);
+          }
           const cPaths = new Map<string, string[]>();
+          const paint = trackPainters.get(track.key);
           for (const { lo, hi, row } of cells) {
-            const val = row ? row[track.key] : undefined;
-            if (val === null || val === undefined || val === "") continue;
-            let color: string, rOut = r2s;
-            if (track.type === "categorical") { color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa"; }
-            else { const n = Number(val); if (isNaN(n)) continue; rOut = r1s + Math.min(1, Math.max(0, n / (track.maxVal || 1))) * (r2s - r1s); color = "#666"; }
+            const cell = paint?.(row);
+            if (!cell) continue;
+            const color = cell.color, rOut = r1s + cell.frac * (r2s - r1s);
             if (!cPaths.has(color)) cPaths.set(color, []);
             // Annular cell: outer arc lo→hi (sweep=1, clockwise on screen), inner arc back (sweep=0).
             // Split at the midpoint so each arc is < π and a full-ring cell (≥ 2π) still draws.
@@ -3151,29 +3427,29 @@ export default function Phylo() {
             const arcPx = curR * arcPerLeaf * gZoom;
             const leafStep = Math.max(1, Math.floor(optLodMinPx / Math.max(arcPx, 1e-9)));
             const cPaths = new Map<string, string[]>();
+            const paint = trackPainters.get(track.key);
             for (let i = 0; i < sortedLeafIds.length; i += leafStep) {
               const idA = sortedLeafIds[i];
               const idB = sortedLeafIds[(i + leafStep) % sortedLeafIds.length];
-              const nd = tree.nodes[idA];
-              const row = annotations.get(nd.name || "");
-              const val = row ? row[track.key] : undefined;
-              if (val === null || val === undefined || val === "") continue;
-              let color: string;
-              if (track.type === "categorical") { color = colorMaps.get(track.key)?.get(val.toString()) ?? "#aaa"; }
-              else { const n = Number(val); if (isNaN(n)) continue; const t = Math.min(1, Math.max(0, n / (track.maxVal || 1))); color = `rgba(80,80,80,${(0.1 + t * 0.85).toFixed(2)})`; }
+              const cell = paint?.(annotations.get(tree.nodes[idA].name || ""));
+              if (!cell) continue;
+              const color = cell.color, rOs = r1s + cell.frac * (r2s - r1s);
               const a1 = coords[idA].angle;
               const a2raw = coords[idB].angle;
               const a2 = a2raw > a1 ? a2raw : a2raw + 2 * Math.PI;
               const large = (a2 - a1) > Math.PI ? 1 : 0;
-              const [ox1, oy1] = [cx + r2s * Math.cos(a1), cy + r2s * Math.sin(a1)];
-              const [ox2, oy2] = [cx + r2s * Math.cos(a2), cy + r2s * Math.sin(a2)];
+              const [ox1, oy1] = [cx + rOs * Math.cos(a1), cy + rOs * Math.sin(a1)];
+              const [ox2, oy2] = [cx + rOs * Math.cos(a2), cy + rOs * Math.sin(a2)];
               const [ix1, iy1] = [cx + r1s * Math.cos(a2), cy + r1s * Math.sin(a2)];
               const [ix2, iy2] = [cx + r1s * Math.cos(a1), cy + r1s * Math.sin(a1)];
               if (!cPaths.has(color)) cPaths.set(color, []);
-              cPaths.get(color)!.push(`M ${f(ox1)},${f(oy1)} A ${f(r2s)},${f(r2s)} 0 ${large},1 ${f(ox2)},${f(oy2)} L ${f(ix1)},${f(iy1)} A ${f(r1s)},${f(r1s)} 0 ${large},0 ${f(ix2)},${f(iy2)} Z`);
+              cPaths.get(color)!.push(`M ${f(ox1)},${f(oy1)} A ${f(rOs)},${f(rOs)} 0 ${large},1 ${f(ox2)},${f(oy2)} L ${f(ix1)},${f(iy1)} A ${f(r1s)},${f(r1s)} 0 ${large},0 ${f(ix2)},${f(iy2)} Z`);
             }
             for (const [color, paths] of cPaths) lines.push(`<path fill="${color}" d="${paths.join(" ")}"/>`);
-            curR += (track.height + TRACK_PADDING) * k;
+            if (track.border?.show) {
+              lines.push(`<path fill="none" stroke="${track.border.color}" stroke-width="${f(track.border.width * k * gZoom)}" d="${svgRingOutline(cx, cy, r1s, r2s, 0, 0, true, f)}"/>`);
+            }
+            curR += (track.height + trackGap(track)) * k;
           }
           lines.push('</g>');
         }
@@ -3249,6 +3525,8 @@ export default function Phylo() {
   };
 
   const loadExample = async () => {
+    deletedStyleStash.current.clear();
+    setDeletedColumns(new Set());
     setCollapsedNodes(new Set());
     setRanges([]);
     setSelectedNode(null);
@@ -3263,28 +3541,60 @@ export default function Phylo() {
     }
   };
 
+  // Session file: everything needed to reopen the current view — tree text,
+  // annotation data (minus deleted columns), ring/legend styling, view,
+  // filters, hidden/collapsed nodes, ranges, selection, search and options.
   const handleSaveSession = () => {
     if (!tree || !newickText) return;
+    const stripDeleted = (f: { name: string; rows: AnnotationRow[]; columns: string[] }) => ({
+      name: f.name,
+      columns: f.columns.filter(c => !deletedColumns.has(c)),
+      rows: deletedColumns.size === 0 ? f.rows : f.rows.map(r => {
+        const o = { ...r };
+        for (const c of deletedColumns) delete o[c];
+        return o;
+      }),
+    });
     const session = {
-      version: 1,
+      version: 2,
       newickText,
-      layout, phylogram, ladderize, rotation, arc, hSpan,
+      layout, phylogram, ladderize, rotation, arc, hSpan, lockHScale,
       vZoom, gZoom, offset,
       showLeafLabels, showTracks, trackOffset, trackOffsetMode, tracksZoomWithTree,
+      annotationFiles: annotationFiles.map(stripDeleted),
       trackConfig,
+      colorMaps: Object.fromEntries(
+        [...colorMaps.entries()].map(([k, v]) => [k, Object.fromEntries(v)])
+      ),
       legend: {
         show: legendShow, title: legendTitle, fontSize: legendFontSize, columns: legendColumns,
         box: legendBox, onlyPresent: legendOnlyPresent, pos: legendPos,
         excluded: [...legendExcluded], hiddenEntries: [...legendHiddenEntries], labels: legendLabels,
+        order: legendOrder, entryOrder: legendEntryOrder,
       },
-      colorMaps: Object.fromEntries(
-        [...colorMaps.entries()].map(([k, v]) => [k, Object.fromEntries(v)])
-      ),
       collapsedFingerprints: [...collapsedNodes].map((id) => nodeToFingerprint(tree, id)),
       ranges: ranges.map((r) => ({ fp: nodeToFingerprint(tree, r.nodeId), color: r.color, label: r.label })),
+      rangeDisplayMode, rangeColorTrackKey,
       hiddenLeafNames: [...hiddenLeafNames],
+      selectedFingerprint: selectedNode !== null && tree.nodes[selectedNode] ? nodeToFingerprint(tree, selectedNode) : null,
+      search: {
+        key: annSearchKey, values: [...annSearchValues], op: annSearchOp, a: annSearchA, b: annSearchB,
+        invert: annSearchInvert, highlight: annHighlight, color: annHighlightColor, dotSize: annDotSize,
+      },
+      support: {
+        colouring: optSupportColouring, showLabels: optShowSupportLabels, asPercent: supportAsPercent,
+        c0: supportC0, c1: supportC1, c2: supportC2, v0: supportV0, v1: supportV1, v2: supportV2,
+      },
+      options: {
+        fontScale: optFontScale, lodMinPx: optLodMinPx, branchThickness: optBranchThickness, barFill: optBarFill,
+        pctIncludeUnlabelled: optPctIncludeUnlabelled, background: optBackground, taperBranches: optTaperBranches,
+        exportScale,
+      },
     };
-    const blob = new Blob([JSON.stringify(session, null, 2)], { type: "application/json" });
+    // Large annotation tables are written compactly.
+    const rowCount = annotationFiles.reduce((n, f) => n + f.rows.length, 0);
+    const json = rowCount > 20000 ? JSON.stringify(session) : JSON.stringify(session, null, 2);
+    const blob = new Blob([json], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "tree-session.json";
@@ -3303,6 +3613,7 @@ export default function Phylo() {
           remapCollapsedRef.current = s.collapsedFingerprints ?? [];
           remapRangesRef.current = s.ranges ?? [];
           remapPendingRef.current = true;
+          pendingSelectRef.current = s.selectedFingerprint ?? null;
           setHiddenLeafNames(new Set(s.hiddenLeafNames ?? []));
           setNewickText(s.newickText);
         }
@@ -3312,6 +3623,7 @@ export default function Phylo() {
         if (s.rotation !== undefined) setRotation(s.rotation);
         if (s.arc !== undefined) setArc(s.arc);
         if (s.hSpan !== undefined) setHSpan(s.hSpan);
+        if (s.lockHScale !== undefined) setLocKHScale(s.lockHScale);
         if (s.vZoom !== undefined) setVZoom(s.vZoom);
         if (s.gZoom !== undefined) setGZoom(s.gZoom);
         if (s.offset) setOffset(s.offset);
@@ -3320,7 +3632,20 @@ export default function Phylo() {
         if (s.trackOffset !== undefined) setTrackOffset(s.trackOffset);
         if (s.trackOffsetMode) setTrackOffsetMode(s.trackOffsetMode);
         if (s.tracksZoomWithTree !== undefined) setTracksZoomWithTree(s.tracksZoomWithTree);
+        // Version 2+ sessions carry their annotation data (deleted columns already removed).
+        if (Array.isArray(s.annotationFiles)) {
+          setAnnotationFiles(s.annotationFiles);
+          setDeletedColumns(new Set());
+          deletedStyleStash.current.clear();
+        }
         if (s.trackConfig) setTrackConfig(s.trackConfig);
+        if (s.colorMaps) {
+          const cm = new Map<string, Map<string, string>>();
+          for (const [k, v] of Object.entries(s.colorMaps)) {
+            cm.set(k, new Map(Object.entries(v as Record<string, string>)));
+          }
+          setColorMaps(cm);
+        }
         // Sessions saved before the legend existed get a default legend rather
         // than inheriting renames/positions from whatever was open before.
         {
@@ -3338,18 +3663,84 @@ export default function Phylo() {
           if (L.excluded) setLegendExcluded(new Set(L.excluded));
           if (L.hiddenEntries) setLegendHiddenEntries(new Set(L.hiddenEntries));
           if (L.labels) setLegendLabels(L.labels);
+          setLegendOrder(Array.isArray(L.order) ? L.order : []);
+          setLegendEntryOrder(L.entryOrder && typeof L.entryOrder === "object" ? L.entryOrder : {});
         }
-        if (s.colorMaps) {
-          const cm = new Map<string, Map<string, string>>();
-          for (const [k, v] of Object.entries(s.colorMaps)) {
-            cm.set(k, new Map(Object.entries(v as Record<string, string>)));
-          }
-          setColorMaps(cm);
+        if (s.rangeDisplayMode) setRangeDisplayMode(s.rangeDisplayMode);
+        if (s.rangeColorTrackKey !== undefined) setRangeColorTrackKey(s.rangeColorTrackKey);
+        if (s.search) {
+          const q = s.search;
+          if (q.key !== undefined) setAnnSearchKey(q.key);
+          setAnnSearchValues(new Set(Array.isArray(q.values) ? q.values : []));
+          setAnnSearchValueFilter("");
+          if (q.op) setAnnSearchOp(q.op);
+          setAnnSearchA(q.a ?? "");
+          setAnnSearchB(q.b ?? "");
+          setAnnSearchInvert(!!q.invert);
+          if (q.highlight !== undefined) setAnnHighlight(q.highlight);
+          if (q.color) setAnnHighlightColor(q.color);
+          if (q.dotSize !== undefined) setAnnDotSize(q.dotSize);
+        }
+        if (s.support) {
+          const sp = s.support;
+          if (sp.colouring !== undefined) setOptSupportColouring(sp.colouring);
+          if (sp.showLabels !== undefined) setOptShowSupportLabels(sp.showLabels);
+          if (sp.asPercent !== undefined) setSupportAsPercent(sp.asPercent);
+          if (sp.c0) setSupportC0(sp.c0);
+          if (sp.c1) setSupportC1(sp.c1);
+          if (sp.c2) setSupportC2(sp.c2);
+          if (sp.v0 !== undefined) setSupportV0(sp.v0);
+          if (sp.v1 !== undefined) setSupportV1(sp.v1);
+          if (sp.v2 !== undefined) setSupportV2(sp.v2);
+        }
+        if (s.options) {
+          const o = s.options;
+          if (o.fontScale !== undefined) setOptFontScale(o.fontScale);
+          if (o.lodMinPx !== undefined) setOptLodMinPx(o.lodMinPx);
+          if (o.branchThickness !== undefined) setOptBranchThickness(o.branchThickness);
+          if (o.barFill !== undefined) setOptBarFill(o.barFill);
+          if (o.pctIncludeUnlabelled !== undefined) setOptPctIncludeUnlabelled(o.pctIncludeUnlabelled);
+          if (o.background) setOptBackground(o.background);
+          if (o.taperBranches !== undefined) setOptTaperBranches(o.taperBranches);
+          if (o.exportScale !== undefined) setExportScale(o.exportScale);
         }
       } catch (err) {
         console.error("Failed to load session:", err);
       }
     });
+  };
+
+  // Annotation table for the leaves currently on the tree: one row per leaf
+  // that has annotations, current (non-deleted) columns in ring order. Headers
+  // are the rings' display names (made unique).
+  const handleExportAnnotations = () => {
+    if (!tree) return;
+    const tracks = trackConfig.filter(t => !annExportVisibleOnly || t.visible);
+    const used = new Set<string>(["id"]);
+    const headers = tracks.map(t => {
+      const base = (t.label || t.key).trim() || t.key;
+      let h = base, n = 2;
+      while (used.has(h)) h = `${base}_${n++}`;
+      used.add(h);
+      return h;
+    });
+    const rows: Record<string, string>[] = [];
+    for (const id of tree.leaves) {
+      const name = tree.nodes[id].name;
+      if (!name) continue;
+      const row = annotations.get(name);
+      if (!row) continue;
+      const out: Record<string, string> = { id: name };
+      tracks.forEach((t, i) => { out[headers[i]] = cellValue(row, t.key); });
+      rows.push(out);
+    }
+    const text = (annExportFormat === "csv" ? d3.csvFormat : d3.tsvFormat)(rows, ["id", ...headers]);
+    const url = URL.createObjectURL(new Blob([text], { type: annExportFormat === "csv" ? "text/csv" : "text/tab-separated-values" }));
+    const aEl = document.createElement("a");
+    aEl.href = url;
+    aEl.download = `annotations.${annExportFormat}`;
+    aEl.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleResetTree = () => {
@@ -3887,9 +4278,31 @@ export default function Phylo() {
               </div>
               <button type="button" className="btn" onClick={handleExportPng} disabled={!tree}>Export PNG</button>
             </div>
-            <div>
+            <div style={{ marginBottom: 6 }}>
               <label className="label" style={{ marginBottom: 4 }}>SVG</label>
               <button type="button" className="btn" onClick={handleExportSvg} disabled={!tree}>Export SVG</button>
+            </div>
+            <div>
+              <label className="label" style={{ marginBottom: 4 }}>Annotations</label>
+              <div className="note" style={{ marginBottom: 4 }}>
+                One row per leaf currently on the tree, with the current (non-deleted) columns in ring order.
+              </div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", marginBottom: 4 }}>
+                <div className="toggle-pill">
+                  {(["tsv", "csv"] as const).map(fmt => (
+                    <button key={fmt} type="button" className={annExportFormat === fmt ? "active" : ""} onClick={() => setAnnExportFormat(fmt)}>
+                      {fmt.toUpperCase()}
+                    </button>
+                  ))}
+                </div>
+                <label className="note" style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <input type="checkbox" checked={annExportVisibleOnly} onChange={(e) => setAnnExportVisibleOnly(e.target.checked)} />
+                  Visible rings only
+                </label>
+              </div>
+              <button type="button" className="btn" onClick={handleExportAnnotations} disabled={!tree || trackConfig.length === 0}>
+                Export annotations
+              </button>
             </div>
           </div>
         )}
@@ -3985,7 +4398,7 @@ export default function Phylo() {
           </div>
           {sectionOpen.annSearch && (
             <div className="row ann-search">
-              <select value={annSearchKey ?? ""} onChange={(e) => setAnnSearchKey(e.target.value || null)} style={{ width: "100%", marginBottom: 6 }}>
+              <select value={annSearchKey ?? ""} onChange={(e) => chooseAnnSearchKey(e.target.value || null)} style={{ width: "100%", marginBottom: 6 }}>
                 {trackConfig.map(t => <option key={t.key} value={t.key}>{t.label || t.key}</option>)}
               </select>
 
@@ -4062,8 +4475,14 @@ export default function Phylo() {
                       <input type="checkbox" checked={annHighlight} onChange={(e) => setAnnHighlight(e.target.checked)} />
                       Highlight on tree
                     </label>
-                    <input type="color" value={annHighlightColor} onChange={(e) => setAnnHighlightColor(e.target.value)}
-                      title="Highlight colour" style={{ width: 28, height: 20, padding: 0, border: "1px solid #ccc", borderRadius: 3 }} />
+                    <Swatch color={annHighlightColor} title="Highlight colour" size={18}
+                      onClick={() => setColorEdit({ title: "Search highlight colour", color: annHighlightColor, apply: setAnnHighlightColor })} />
+                    <label className="note" style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: "auto" }} title="Dot radius in pixels">
+                      Dot size
+                      <input type="range" min={1} max={12} step={0.5} value={annDotSize}
+                        onChange={(e) => setAnnDotSize(Number(e.target.value))} style={{ width: 64 }} />
+                      <span style={{ minWidth: 22 }}>{annDotSize}</span>
+                    </label>
                   </div>
                   <div className="selection-actions">
                     <button className="btn" onClick={handleSelectMatchClade} disabled={!annMatches.ids.length}
@@ -4120,7 +4539,7 @@ export default function Phylo() {
             <label className="label">{editingRangeIndex !== null ? "Edit Range" : "Add New Range"}</label>
             <div className="row">
               <label className="label" style={{ fontSize: 13, fontWeight: "normal" }}>Range Colour</label>
-              <HexColorPicker color={activeRangeColor} onChange={setActiveRangeColor} />
+              <ColorPickerPanel color={activeRangeColor} onChange={setActiveRangeColor} />
             </div>
             <div className="row">
               <label className="label" style={{ fontSize: 13, fontWeight: "normal" }}>Range Label (optional)</label>
@@ -4287,7 +4706,7 @@ export default function Phylo() {
         )}
 
         {/* ── SECTION: Annotation Tracks (moved to bottom) ── */}
-        {trackConfig.length > 0 && (<>
+        {(trackConfig.length > 0 || deletedColumns.size > 0) && (<>
           <div className="section-header" onClick={() => toggleSection("tracks")}>
             <span>Annotation Tracks</span>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -4411,45 +4830,55 @@ export default function Phylo() {
                         </select>
                         <input type="number" value={track.height} onChange={(e) => updateTrack(i, "height", e.target.value)} style={{ width: 46 }} min="1" max="100" />
                         <span className="note">px</span>
-                        {track.type === "categorical" && (
-                          <button className="btn" style={{ padding: "2px 5px", fontSize: 11 }} onClick={() => setShowLegendKey(track.key === showLegendKey ? null : track.key)}>
-                            Edit colours {showLegendKey === track.key ? "▴" : "▾"}
-                          </button>
-                        )}
+                        <button className="btn" style={{ padding: "2px 5px", fontSize: 11 }} onClick={() => setShowLegendKey(track.key === showLegendKey ? null : track.key)}>
+                          Style {showLegendKey === track.key ? "▴" : "▾"}
+                        </button>
                       </div>
                     </div>
-                    {/* Inline legend for this track */}
-                    {showLegendKey === track.key && colorMaps.get(track.key) && (
-                      <div style={{ marginLeft: 8, marginBottom: 4, background: "#fff", border: "1px solid #ddd", padding: "4px 6px", borderRadius: 4 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
-                          <span className="note" style={{ flexShrink: 0 }}>Apply palette:</span>
-                          <select
-                            className="note"
-                            value={selectedPalette}
-                            onChange={(e) => setSelectedPalette(e.target.value)}
-                            style={{ fontSize: 11, flexGrow: 1 }}
-                          >
-                            {CATEGORICAL_PALETTES.map(p => (
-                              <option key={p.name} value={p.name}>{p.name}</option>
-                            ))}
-                          </select>
-                          <button className="btn" style={{ padding: "2px 6px", fontSize: 11 }} onClick={() => applyPalette(track.key, selectedPalette)}>
-                            Apply
-                          </button>
-                        </div>
-                        <div style={{ maxHeight: 140, overflowY: "auto" }}>
-                          {[...colorMaps.get(track.key)!.entries()].map(([category, color]) => (
-                            <div key={category} className="legend-item">
-                              <div className="legend-swatch" style={{ background: color }} onClick={() => setEditingColor({ trackKey: track.key, category })} />
-                              <span className="legend-label">{category || "(empty)"}</span>
-                            </div>
-                          ))}
+                    {/* Ring style editor */}
+                    {showLegendKey === track.key && (
+                      <div className="track-style-box">
+                        <TrackStylePanel
+                          track={track}
+                          colorMap={colorMaps.get(track.key)}
+                          numericColumns={numericColumns}
+                          stats={numStats}
+                          palettes={CATEGORICAL_PALETTES}
+                          selectedPalette={selectedPalette}
+                          setSelectedPalette={setSelectedPalette}
+                          applyPalette={applyPalette}
+                          onPatch={(patch) => patchTrack(track.key, patch)}
+                          onEditCategory={(category) => setEditingColor({ trackKey: track.key, category })}
+                          editColor={(title, color, apply) => setColorEdit({ title, color, apply })}
+                        />
+                        <div className="style-actions">
+                          <button type="button" className="btn" onClick={() => setStyleClip(copyStyle(track, colorMaps.get(track.key)))}
+                            title="Copy this ring's colours and style">Copy style</button>
+                          <button type="button" className="btn"
+                            disabled={!styleClip || styleClip.type !== track.type}
+                            title={!styleClip ? "Copy a ring's style first"
+                              : styleClip.type !== track.type ? `Copied style is ${styleClip.type}; this ring is ${track.type}`
+                              : `Paste the style copied from “${styleClip.fromLabel}”`}
+                            onClick={() => pasteStyleTo(track)}
+                          >Paste style{styleClip && styleClip.type === track.type ? ` (${styleClip.fromLabel})` : ""}</button>
+                          <button type="button" className="btn btn-danger" style={{ marginLeft: "auto" }}
+                            title="Remove this annotation column (restore it from the list below)"
+                            onClick={() => { deleteColumn(track.key); setShowLegendKey(null); }}
+                          >Delete column</button>
                         </div>
                       </div>
                     )}
                   </div>
                 ))}
               </div>
+              {deletedColumns.size > 0 && (
+                <div className="note" style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                  Deleted: {[...deletedColumns].join(", ")}
+                  <button type="button" className="btn" style={{ fontSize: 11, padding: "1px 6px" }} onClick={() => setDeletedColumns(new Set())}>
+                    Restore
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </>)}
@@ -4490,20 +4919,61 @@ export default function Phylo() {
                 <input type="checkbox" checked={legendOnlyPresent} onChange={(e) => setLegendOnlyPresent(e.target.checked)} />
                 Only categories present in the tree
               </label>
-              <div className="note" style={{ fontWeight: 600, marginBottom: 4 }}>Include</div>
-              {legendSectionChoices.length === 0 && <div className="note">Nothing to show yet — load annotations or add coloured ranges.</div>}
-              {legendSectionChoices.map(s => (
-                <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 2 }}>
-                  <input type="checkbox" checked={!legendExcluded.has(s.id)} onChange={(e) => toggleLegendSection(s.id, e.target.checked)} />
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.label}</span>
-                </label>
-              ))}
+              <div className="note" style={{ fontWeight: 600, marginBottom: 2 }}>Sections &amp; items</div>
+              <div className="note" style={{ marginBottom: 4 }}>Drag ⠿ to reorder; untick to leave out; ▸ to reorder or hide items.</div>
+              {legendCatalog.length === 0 && <div className="note">Nothing to show yet — load annotations or add coloured ranges.</div>}
+              <DragList
+                items={legendCatalog}
+                getKey={(sec) => sec.id}
+                onMove={(from, to) => setLegendOrder(prev => mergeMove(prev, legendCatalog.map(sec => sec.id), from, to))}
+                renderItem={(sec, handle) => {
+                  const open = legendExpanded.has(sec.id);
+                  return (
+                    <div className="legend-sec">
+                      <div className="legend-sec-head">
+                        {handle}
+                        <input type="checkbox" checked={!legendExcluded.has(sec.id)} onChange={(e) => toggleLegendSection(sec.id, e.target.checked)} />
+                        <span className="legend-sec-title">{sec.title}</span>
+                        {sec.kind === "swatches" && (
+                          <button type="button" className="btn legend-sec-toggle" title={open ? "Hide items" : "Show items"}
+                            onClick={() => setLegendExpanded(prev => { const n = new Set(prev); if (n.has(sec.id)) n.delete(sec.id); else n.add(sec.id); return n; })}
+                          >{open ? "▾" : "▸"} {sec.entries.length}</button>
+                        )}
+                      </div>
+                      {open && sec.kind === "swatches" && (
+                        <div className="legend-sec-items">
+                          <DragList
+                            items={sec.entries.slice(0, LEGEND_PANEL_MAX_ITEMS)}
+                            getKey={(e) => e.id}
+                            onMove={(from, to) => setLegendEntryOrder(prev => ({ ...prev, [sec.id]: mergeMove(prev[sec.id], sec.entries.map(e => e.id), from, to) }))}
+                            renderItem={(e, h) => (
+                              <div className="legend-entry-row">
+                                {h}
+                                <input type="checkbox" checked={!legendHiddenEntries.has(e.id)} title="Show in legend"
+                                  onChange={(ev) => setLegendHiddenEntries(prev => { const n = new Set(prev); if (ev.target.checked) n.delete(e.id); else n.add(e.id); return n; })} />
+                                <span className="legend-swatch" style={{ width: 12, height: 12, background: e.stops ? `linear-gradient(to right, ${e.stops.map(x => x.color).join(", ")})` : e.color, opacity: e.fillAlpha < 1 ? 0.6 : 1 }} />
+                                <span className="legend-entry-label" title={e.label}>{e.label}</span>
+                              </div>
+                            )}
+                          />
+                          {sec.entries.length > LEGEND_PANEL_MAX_ITEMS && (
+                            <div className="note">… {sec.entries.length - LEGEND_PANEL_MAX_ITEMS} more not listed</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                }}
+              />
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
                 <button type="button" className="btn" onClick={() => setLegendPos(null)} disabled={!legendPos}>Reset position</button>
                 {legendHiddenEntries.size > 0 && (
                   <button type="button" className="btn" onClick={() => setLegendHiddenEntries(new Set())}>
                     Restore hidden entries ({legendHiddenEntries.size})
                   </button>
+                )}
+                {(legendOrder.length > 0 || Object.keys(legendEntryOrder).length > 0) && (
+                  <button type="button" className="btn" onClick={() => { setLegendOrder([]); setLegendEntryOrder({}); }}>Reset order</button>
                 )}
                 {Object.keys(legendLabels).length > 0 && (
                   <button type="button" className="btn" onClick={() => setLegendLabels({})}>Reset renamed text</button>
@@ -4716,7 +5186,7 @@ export default function Phylo() {
               <span>Support colour: {editingSupportSlot}</span>
               <button onClick={() => setEditingSupportSlot(null)} style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 16 }}>×</button>
             </div>
-            <HexColorPicker
+            <ColorPickerPanel
               color={editingSupportSlot === "low" ? supportC0 : editingSupportSlot === "mid" ? supportC1 : supportC2}
               onChange={(c) => { if (editingSupportSlot === "low") setSupportC0(c); else if (editingSupportSlot === "mid") setSupportC1(c); else setSupportC2(c); }}
             />
@@ -4733,12 +5203,31 @@ export default function Phylo() {
               <span>{ranges[editingRangeGroup[0]]?.label || "Range colour"}</span>
               <button onClick={() => setEditingRangeGroup(null)} style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 16 }}>×</button>
             </div>
-            <HexColorPicker
+            <ColorPickerPanel
               color={ranges[editingRangeGroup[0]]?.color ?? "#ffe08a"}
               onChange={(c) => {
                 const idx = new Set(editingRangeGroup);
+                const r0 = ranges[editingRangeGroup[0]];
+                if (r0) renameRangeEntry(rangeEntryId(r0.label || `Node ${r0.nodeId}`, r0.color), rangeEntryId(r0.label || `Node ${r0.nodeId}`, c));
                 setRanges(prev => prev.map((r, i) => (idx.has(i) ? { ...r, color: c } : r)));
               }}
+            />
+          </div>
+        </>
+      )}
+
+      {/* Generic colour editor (gradient stops, bar colours, shade lows …) */}
+      {colorEdit && (
+        <>
+          <div className="modal-backdrop" onClick={() => setColorEdit(null)} />
+          <div className="modal-content">
+            <div className="modal-header">
+              <span>{colorEdit.title}</span>
+              <button onClick={() => setColorEdit(null)} style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 16 }}>×</button>
+            </div>
+            <ColorPickerPanel
+              color={colorEdit.color}
+              onChange={(c) => { colorEdit.apply(c); setColorEdit(ce => (ce ? { ...ce, color: c } : ce)); }}
             />
           </div>
         </>
@@ -4753,7 +5242,7 @@ export default function Phylo() {
               <span>{editingColor.category || "(empty)"}</span>
               <button onClick={() => setEditingColor(null)} style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 16 }}>×</button>
             </div>
-            <HexColorPicker color={colorMaps.get(editingColor.trackKey)?.get(editingColor.category) || "#aaa"} onChange={handleColorChange} />
+            <ColorPickerPanel color={colorMaps.get(editingColor.trackKey)?.get(editingColor.category) || "#aaa"} onChange={handleColorChange} />
           </div>
         </>
       )}

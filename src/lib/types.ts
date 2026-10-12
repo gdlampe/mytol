@@ -36,6 +36,36 @@ export type AnnotationRow = {
   [key: string]: any;
 };
 
+export type ScaleType = "linear" | "log";
+
+/** How a continuous ring maps values to colour/length. min/max null = automatic (from data). */
+export type ContinuousStyle = {
+  mode: "bar" | "gradient";
+  barColor: string;
+  /** Gradient colours, low → high */
+  stops: string[];
+  scale: ScaleType;
+  /** Log base (log scale only; default 10). Auto min/max snap to powers of it. */
+  logBase?: number;
+  min: number | null;
+  max: number | null;
+};
+
+/**
+ * Categorical ring shaded by a numeric column: each category is drawn on a
+ * gradient from its own low colour (default white) to its category colour.
+ */
+export type ShadeStyle = {
+  by: string;
+  low: Record<string, string>;
+  scale: ScaleType;
+  logBase?: number;
+  min: number | null;
+  max: number | null;
+};
+
+export type RingBorder = { show: boolean; color: string; width: number };
+
 export type TrackConfig = {
   key: string;
   label: string;
@@ -43,6 +73,16 @@ export type TrackConfig = {
   height: number;
   maxVal?: number;
   visible: boolean;
+  /** Continuous styling (defaults applied when absent) */
+  cont?: ContinuousStyle;
+  /** Categorical: optional shading by a numeric column */
+  shade?: ShadeStyle | null;
+  /** The user picked the type by hand (don't auto-switch it when data changes). */
+  userType?: boolean;
+  /** Space after this ring, px (default TRACK_PADDING). */
+  gap?: number;
+  /** Outline drawn around this ring. */
+  border?: RingBorder;
 };
 
 // ============================================================
