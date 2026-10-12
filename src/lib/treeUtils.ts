@@ -116,18 +116,11 @@ export function buildTree(ast: any): Tree {
       propCat: undefined,
     };
 
-    // Numeric internal-node name → bootstrap support value.
-    // Handles plain numbers ("95", "0.95") and IQ-TREE's "SH-aLRT/UFBoot" format ("95/100") —
-    // in the latter case the second value (UFBoot) is used as it's directly comparable to bootstrap.
+    // Numeric internal-node name → support values. Plain numbers ("95", "0.95")
+    // or several separated by "/" (IQ-TREE, e.g. "92.7/0.995/93" = SH-aLRT/aBayes/UFBoot).
     if (!node.isLeaf && a.name) {
-      const slashIdx = a.name.indexOf("/");
-      if (slashIdx !== -1) {
-        const second = parseFloat(a.name.slice(slashIdx + 1));
-        if (!isNaN(second)) node.support = second > 1 ? second / 100 : second;
-      } else if (/^-?\d+(\.\d+)?$/.test(a.name)) {
-        const v = parseFloat(a.name);
-        node.support = v > 1 ? v / 100 : v;
-      }
+      const vals = parseSupportLabel(a.name);
+      if (vals) node.supports = vals;
     }
 
     nodes.push(node);
@@ -164,7 +157,61 @@ export function buildTree(ast: any): Tree {
   }
   dfs(root, 0, 0);
 
-  return { nodes, root, leaves, nameToNode };
+  const tree: Tree = { nodes, root, leaves, nameToNode };
+  indexSupports(tree);
+  return tree;
+}
+
+/** Numbers in a support label ("95", "0.95", "92.7/0.995/93", "/95"), or null if it isn't one. */
+export function parseSupportLabel(label: string): number[] | null {
+  const parts = label.split("/").map(p => p.trim());
+  let any = false;
+  const vals = parts.map(p => {
+    if (p === "") return NaN;
+    const v = Number(p);
+    if (Number.isFinite(v)) any = true;
+    return v;
+  });
+  // Every part must be a number or blank, and at least one a number.
+  if (!any || parts.some((p, i) => p !== "" && !Number.isFinite(vals[i]))) return null;
+  return vals;
+}
+
+/**
+ * Sets tree.supportCount / supportScale from the parsed labels and each node's
+ * default support (the last value, as 0–1). A value is a percentage when any
+ * node has it above 1 — judged per value, so UFBoot "1" still means 1 %.
+ */
+export function indexSupports(tree: Tree): void {
+  let count = 0;
+  for (const nd of tree.nodes) if (nd.supports) count = Math.max(count, nd.supports.length);
+  const max = new Array<number>(count).fill(-Infinity);
+  for (const nd of tree.nodes) nd.supports?.forEach((v, i) => { if (Number.isFinite(v)) max[i] = Math.max(max[i], v); });
+  tree.supportCount = count;
+  tree.supportScale = max.map(m => (m > 1 ? 100 : 1));
+  for (const nd of tree.nodes) nd.support = supportValue(tree, nd, count - 1);
+}
+
+/** Support value i of a node as 0–1, or undefined. */
+export function supportValue(tree: Tree, nd: Node, i: number): number | undefined {
+  const v = nd.supports?.[i];
+  return v !== undefined && Number.isFinite(v) ? v / (tree.supportScale?.[i] ?? 1) : undefined;
+}
+
+/**
+ * Display names for a tree's support values. IQ-TREE writes them in a fixed
+ * order (SH-aLRT, aBayes, UFBoot — only the tests that were run), so the
+ * common combinations are recognised from how many there are and their scales.
+ */
+export function guessSupportNames(count: number, scale: number[]): string[] {
+  const key = scale.join(",");
+  const known: Record<string, string[]> = {
+    "100,1,100": ["SH-aLRT", "aBayes", "UFBoot"],
+    "100,100": ["SH-aLRT", "UFBoot"],
+    "100,1": ["SH-aLRT", "aBayes"],
+    "1,100": ["aBayes", "UFBoot"],
+  };
+  return known[key] ?? Array.from({ length: count }, (_, i) => `Value ${i + 1}`);
 }
 
 // ============================================================

@@ -49,6 +49,8 @@ import {
   computeLeafCounts,
   ladderizeTree,
   rerootAtNode,
+  supportValue,
+  guessSupportNames,
 } from "../lib/treeUtils";
 import {
   layoutRectangular,
@@ -363,6 +365,11 @@ export default function Phylo() {
   const [supportV1, setSupportV1] = useState(0.5);
   const [supportV2, setSupportV2] = useState(1);
   const [supportAsPercent, setSupportAsPercent] = useState<boolean>(false);
+  // Labels with several values (IQ-TREE "SH-aLRT/aBayes/UFBoot"): which one colours
+  // and labels branches (null = the last), user names for them, and label mode.
+  const [supportIndex, setSupportIndex] = useState<number | null>(null);
+  const [supportNames, setSupportNames] = useState("");
+  const [supportLabelsAll, setSupportLabelsAll] = useState(false);
 
 
   // ------------ Interaction / hover ------------
@@ -899,7 +906,26 @@ export default function Phylo() {
     return m;
   }, [tree, annotations, catTrackKeysSig]);
 
-  const treeHasSupport = useMemo(() => !!tree && tree.nodes.some(n => n.support !== undefined), [tree]);
+  // Support per node (0–1) for the chosen value; names for each value.
+  const supportCount = tree?.supportCount ?? 0;
+  const supportIdx = supportCount ? clamp(supportIndex ?? supportCount - 1, 0, supportCount - 1) : 0;
+  const nodeSupport = useMemo(
+    () => (tree ? tree.nodes.map(nd => supportValue(tree, nd, supportIdx)) : []),
+    [tree, supportIdx]
+  );
+  const treeHasSupport = useMemo(() => nodeSupport.some(v => v !== undefined), [nodeSupport]);
+  const supportGuess = useMemo(() => guessSupportNames(supportCount, tree?.supportScale ?? []), [tree, supportCount]);
+  const supportNameList = useMemo(() => {
+    const user = supportNames.split("/").map(n => n.trim());
+    return supportGuess.map((g, i) => user[i] || g);
+  }, [supportGuess, supportNames]);
+  const fmtSupport = (v: number) => (Number.isFinite(v) ? String(v) : "–");
+  /** Branch label: the chosen value as written in the tree, or all of them. */
+  const supportLabel = (nd: Node) =>
+    supportLabelsAll ? (nd.supports ?? []).map(fmtSupport).join("/") : fmtSupport(nd.supports?.[supportIdx] ?? NaN);
+  /** "SH-aLRT 92.7 · aBayes 0.995 · UFBoot 93" (tooltips, selection info). */
+  const supportText = (nd: Node) =>
+    (nd.supports ?? []).map((v, i) => (supportCount > 1 ? `${supportNameList[i] ?? `Value ${i + 1}`} ${fmtSupport(v)}` : fmtSupport(v))).join(" · ");
 
   // Numeric stats for every column (drive value scales) and one painter per
   // ring — shared by all canvas and SVG renderers and by the legend.
@@ -986,7 +1012,7 @@ export default function Phylo() {
     if (optSupportColouring && treeHasSupport) {
       const fmt = (v: number) => (supportAsPercent ? v.toFixed(0) : String(+v.toFixed(2)));
       sections.push({
-        id: "support", title: text("support", "Branch support"), kind: "gradient",
+        id: "support", title: text("support", supportCount > 1 ? `Branch support (${supportNameList[supportIdx]})` : "Branch support"), kind: "gradient",
         stops: [supportC0, supportC1, supportC2].map(color => ({ color, opacity: 1 })),
         labels: [fmt(supportV0), fmt(supportV1), fmt(supportV2)],
         edits: (["low", "mid", "high"] as const).map(slot => ({ type: "support" as const, slot })),
@@ -1000,6 +1026,7 @@ export default function Phylo() {
     ranges, rangeDisplayMode,
     optSupportColouring, treeHasSupport, supportAsPercent,
     supportC0, supportC1, supportC2, supportV0, supportV1, supportV2,
+    supportCount, supportNameList, supportIdx,
   ]);
 
   // What the legend actually draws: included sections, visible entries, capped.
@@ -1021,8 +1048,10 @@ export default function Phylo() {
   // Colouring helpers
   // ==========================================================
 
+  /** Colour for a support value (0–1); thresholds are in display units (% or 0–1). */
   function supportColor(val: number): string {
-    let v = clamp(val, Math.min(supportV0, supportV2), Math.max(supportV0, supportV2));
+    const u = supportAsPercent ? val * 100 : val;
+    let v = clamp(u, Math.min(supportV0, supportV2), Math.max(supportV0, supportV2));
     if (v <= supportV1) {
       const denom = supportV1 - supportV0;
       const t = denom > 0 ? (v - supportV0) / denom : 0;
@@ -1538,7 +1567,7 @@ export default function Phylo() {
           ctx.fill();
         }
 
-        const color_P = nodeColor(nd.id, nd.support);
+        const color_P = nodeColor(nd.id, nodeSupport[nd.id]);
         const lw_P = nodeWidthPx[nd.id];
 
         for (const ch of nd.children) {
@@ -1546,7 +1575,7 @@ export default function Phylo() {
           const xc = -W / 2 + PADDING + sx * b.x;
           const yc = -H / 2 + PADDING + sy * b.y;
 
-          const color_C = nodeColor(ch, nodes[ch].support);
+          const color_C = nodeColor(ch, nodeSupport[ch]);
           const lw_C = nodeWidthPx[ch];
 
           // Vertical segment
@@ -1652,7 +1681,7 @@ export default function Phylo() {
         const P = rectToPolar(rectMaxX > 0 ? aRect.x / rectMaxX : 0, aRect.y, N, R, startAngleDeg, arcDeg);
         if (!worldVisible(P.x, P.y)) continue;
 
-        const color_P = nodeColor(nd.id, nd.support);
+        const color_P = nodeColor(nd.id, nodeSupport[nd.id]);
         const lw_P = nodeWidthPx[nd.id] / gZoom;
 
         for (const ch of nd.children) {
@@ -1660,7 +1689,7 @@ export default function Phylo() {
           const C = rectToPolar(rectMaxX > 0 ? bRect.x / rectMaxX : 0, bRect.y, N, R, startAngleDeg, arcDeg);
           if (!worldVisible(P.x, P.y) && !worldVisible(C.x, C.y)) continue;
 
-          const color_C = nodeColor(ch, nodes[ch].support);
+          const color_C = nodeColor(ch, nodeSupport[ch]);
           const lw_C = nodeWidthPx[ch] / gZoom;
 
           if (P.radius > 0) {
@@ -1756,7 +1785,7 @@ export default function Phylo() {
           if (!worldVisible(ax, ay) && !worldVisible(bx, by)) continue;
           const segLenPx = Math.hypot((bx - ax) * gZoom, (by - ay) * gZoom);
           if (segLenPx <= MIN_SEG_PX) continue;
-          const sup = nodes[ch].support;
+          const sup = nodeSupport[ch];
           ctx.beginPath();
           ctx.moveTo(ax, ay);
           ctx.lineTo(bx, by);
@@ -2085,7 +2114,8 @@ export default function Phylo() {
         ctx.textBaseline = "bottom";
         for (const nd of nodes) {
           if (skipNode[nd.id] === 2 || skipNode[nd.id] === 1) continue;
-          if (nd.support === undefined || nd.children.length === 0) continue;
+          const sup = nodeSupport[nd.id];
+          if (sup === undefined || nd.children.length === 0) continue;
           if (nd.id !== treeRoot) {
             const cladePx = (nd.R - nd.L) * leafSpacingPx;
             if (cladePx < optLodMinPx && optLodMinPx > 0) continue;
@@ -2094,8 +2124,8 @@ export default function Phylo() {
           const screenX = PADDING + sx * a.x + offset.x;
           const screenY = H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * a.y);
           if (screenY < -fontSize || screenY > H + fontSize || screenX < 0 || screenX > W) continue;
-          const label = supportAsPercent ? nd.support.toFixed(0) : nd.support.toFixed(2);
-          ctx.fillStyle = optSupportColouring ? supportColor(nd.support) : "#555";
+          const label = supportLabel(nd);
+          ctx.fillStyle = optSupportColouring ? supportColor(sup) : "#555";
           ctx.fillText(label, screenX + 3, screenY);
         }
         ctx.restore();
@@ -2283,7 +2313,7 @@ export default function Phylo() {
     tracksZoomWithTree, trackPainters,
     annMatches, annHighlight, annHighlightColor, annStepTargets, annDotSize,
     legendModel, legendPos, legendFontSize, legendColumns, legendBox,
-    viewSize,
+    viewSize, nodeSupport, supportLabelsAll,
   ]);
 
   // ==========================================================
@@ -2540,7 +2570,7 @@ export default function Phylo() {
       const nd = tree.nodes[nodeUnder];
       const leaves = (nd as any).leaves ?? nd.R - nd.L;
       let info = `${leaves} leaves\nBranch: ${nd.length.toFixed(4)}`;
-      if (nd.support !== undefined) info += `\nSupport: ${nd.support}`;
+      if (nd.supports) info += `\nSupport: ${supportText(nd)}`;
       if (nd.isLeaf) {
         const name = nd.name || "";
         const row = annotations.get(name);
@@ -3191,12 +3221,12 @@ export default function Phylo() {
         }
         const a = (coords as any)[nd.id];
         const xp = nsX(a.x), yp = nsY(a.y);
-        const cP = nd.support !== undefined ? supportColor(nd.support) : "#333";
+        const cP = nodeSupport[nd.id] !== undefined ? supportColor(nodeSupport[nd.id]!) : "#333";
         for (const ch of nd.children) {
           if (skipNode[ch] === 2) continue;
           const b = (coords as any)[ch];
           const xc = nsX(b.x), yc = nsY(b.y);
-          const cC = tree.nodes[ch].support !== undefined ? supportColor(tree.nodes[ch].support!) : "#333";
+          const cC = nodeSupport[ch] !== undefined ? supportColor(nodeSupport[ch]!) : "#333";
           const vh = Math.abs(yc - yp);
           if (vh >= MIN_EDGE_PIXELS) {
             if (!vPaths.has(cP)) vPaths.set(cP, []);
@@ -3306,12 +3336,12 @@ export default function Phylo() {
         }
         const P = getPolar(nd.id); const Ps = gp(P);
         if (!svgVisible(Ps.x, Ps.y)) continue;
-        const cP = nd.support !== undefined ? supportColor(nd.support) : "#333";
+        const cP = nodeSupport[nd.id] !== undefined ? supportColor(nodeSupport[nd.id]!) : "#333";
         for (const ch of nd.children) {
           if (skipNode[ch] === 2) continue;
           const C = getPolar(ch); const Cs = gp(C);
           if (!svgVisible(Ps.x, Ps.y) && !svgVisible(Cs.x, Cs.y)) continue;
-          const cC = tree.nodes[ch].support !== undefined ? supportColor(tree.nodes[ch].support!) : "#333";
+          const cC = nodeSupport[ch] !== undefined ? supportColor(nodeSupport[ch]!) : "#333";
           if (P.radius > 0) {
             let da = C.angle - P.angle;
             if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
@@ -3440,7 +3470,7 @@ export default function Phylo() {
           if (!svgVisible(p.x, p.y) && !svgVisible(c.x, c.y)) continue;
           const segLen = Math.hypot(c.x - p.x, c.y - p.y);
           if (segLen <= MIN_SEG_PX) continue;
-          const color = tree.nodes[ch].support !== undefined ? supportColor(tree.nodes[ch].support!) : "#333";
+          const color = nodeSupport[ch] !== undefined ? supportColor(nodeSupport[ch]!) : "#333";
           if (!bPaths.has(color)) bPaths.set(color, []);
           bPaths.get(color)!.push(`M ${f(p.x)},${f(p.y)} L ${f(c.x)},${f(c.y)}`);
         }
@@ -3623,6 +3653,7 @@ export default function Phylo() {
       support: {
         colouring: optSupportColouring, showLabels: optShowSupportLabels, asPercent: supportAsPercent,
         c0: supportC0, c1: supportC1, c2: supportC2, v0: supportV0, v1: supportV1, v2: supportV2,
+        index: supportIndex, names: supportNames, labelsAll: supportLabelsAll,
       },
       options: {
         fontScale: optFontScale, lodMinPx: optLodMinPx, branchThickness: optBranchThickness, barFill: optBarFill,
@@ -3731,6 +3762,9 @@ export default function Phylo() {
           if (sp.v0 !== undefined) setSupportV0(sp.v0);
           if (sp.v1 !== undefined) setSupportV1(sp.v1);
           if (sp.v2 !== undefined) setSupportV2(sp.v2);
+          setSupportIndex(typeof sp.index === "number" ? sp.index : null);
+          setSupportNames(typeof sp.names === "string" ? sp.names : "");
+          setSupportLabelsAll(!!sp.labelsAll);
         }
         if (s.options) {
           const o = s.options;
@@ -3951,6 +3985,13 @@ export default function Phylo() {
     setSupportAsPercent(isChecked);
     const factor = isChecked ? 100 : 1 / 100;
     setSupportV0((v) => v * factor); setSupportV1((v) => v * factor); setSupportV2((v) => v * factor);
+  };
+
+  // Choosing a support value also switches the threshold units to its scale.
+  const pickSupportValue = (i: number) => {
+    setSupportIndex(i);
+    const pct = tree?.supportScale?.[i] === 100;
+    if (pct !== supportAsPercent) handlePercentToggle(pct);
   };
 
   const selectedNodeInfo = selectedNode !== null && tree ? tree.nodes[selectedNode] : null;
@@ -4553,7 +4594,7 @@ export default function Phylo() {
             <div className="selection-info">
               <strong>Leaves:</strong> {(selectedNodeInfo as any).leaves ?? selectedNodeInfo.R - selectedNodeInfo.L}<br />
               <strong>Length:</strong> {selectedNodeInfo.length.toFixed(4)}<br />
-              <strong>Support:</strong> {selectedNodeInfo.support ?? "N/A"}
+              <strong>Support:</strong> {selectedNodeInfo.supports ? supportText(selectedNodeInfo) : "N/A"}
               {selectedCladeMatchCount !== null && (<>
                 <br /><strong>Search matches:</strong> {selectedCladeMatchCount.toLocaleString()}
               </>)}
@@ -4717,6 +4758,31 @@ export default function Phylo() {
         </div>
         {sectionOpen.support && (
           <div className="row">
+            {supportCount > 1 && (
+              <div className="style-panel" style={{ marginTop: 6, marginBottom: 8, gap: 4 }}>
+                <div className="style-row">
+                  <span className="note">Colour by</span>
+                  <select value={supportIdx} onChange={(e) => pickSupportValue(Number(e.target.value))} style={{ flex: 1, minWidth: 0, fontSize: 12 }}>
+                    {supportNameList.map((n, i) => (
+                      <option key={i} value={i}>{`${n} (value ${i + 1}, ${tree?.supportScale?.[i] === 100 ? "0–100" : "0–1"})`}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="style-row">
+                  <span className="note">Names</span>
+                  <input type="text" value={supportNames} placeholder={supportGuess.join(" / ")}
+                    title="Names for the values, separated by /"
+                    onChange={(e) => setSupportNames(e.target.value)} style={{ flex: 1, minWidth: 0, fontSize: 12 }} />
+                </div>
+                <label className="note" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <input type="checkbox" checked={supportLabelsAll} onChange={(e) => setSupportLabelsAll(e.target.checked)} />
+                  Branch labels show all values
+                </label>
+                <div className="note">
+                  Each node label holds {supportCount} values. IQ-TREE writes them as SH-aLRT / aBayes / UFBoot (only the tests you ran, in that order); the names are guessed from their scales, so type your own if they differ.
+                </div>
+              </div>
+            )}
             <div className="note" style={{ marginTop: 4 }}>Three-colour gradient: low → mid → high. Click a swatch to edit.</div>
             <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginTop: 8, marginBottom: 4 }}>
               {([["Low", supportC0, "low"], ["Mid", supportC1, "mid"], ["High", supportC2, "high"]] as const).map(([lbl, col, slot]) => (

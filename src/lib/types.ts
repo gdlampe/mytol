@@ -8,7 +8,10 @@ export type Node = {
   parent: number | null;
   children: number[];
   length: number;
+  /** Support (0–1) of the tree's default value: the last one in the label. */
   support?: number;
+  /** Every number in the node label, as written (IQ-TREE "92.7/0.995/93" → [92.7, 0.995, 93]); NaN = blank part. */
+  supports?: number[];
   isLeaf: boolean;
   depth: number;
   cumLen: number;
@@ -25,6 +28,10 @@ export type Tree = {
   root: number;
   leaves: number[];
   nameToNode: Map<string, number>;
+  /** Most support values on any node label (IQ-TREE writes one per test, e.g. SH-aLRT/aBayes/UFBoot). */
+  supportCount?: number;
+  /** Per value: 100 if written as a percentage (any value > 1), else 1. Divide by it for 0–1. */
+  supportScale?: number[];
 };
 
 // ============================================================
