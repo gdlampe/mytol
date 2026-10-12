@@ -167,6 +167,9 @@ const PANEL_WIDTH_KEY = "mytol.panelWidth";
 const clampPanelWidth = (w: number) =>
   Math.round(Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, window.innerWidth - 240, w)));
 
+/** Legend entry id of a coloured range (ranges are grouped by label + colour). */
+const rangeEntryId = (label: string, color: string) => `ranges\x00${label}\x00${color}`;
+
 /** Longest category list drawn per legend section (the rest collapse to "… N more"). */
 const LEGEND_MAX_ENTRIES = 100;
 /** Longest item list shown per section in the Legend panel. */
@@ -3382,9 +3385,8 @@ export default function Phylo() {
   // Legend editing
   // ==========================================================
 
-  // Range legend entries are keyed by label + colour; when either changes,
-  // carry the entry's saved position and hidden state over to its new id.
-  const rangeEntryId = (label: string, color: string) => `ranges\x00${label}\x00${color}`;
+  // Range legend entries are keyed by label + colour (rangeEntryId); when either
+  // changes, carry the entry's saved position and hidden state over to its new id.
   const renameRangeEntry = (oldId: string, newId: string) => {
     if (oldId === newId) return;
     setLegendEntryOrder(prev => {
