@@ -10,6 +10,8 @@ import {
   activeShade,
 } from "../lib/trackStyle";
 import type { NumStats } from "../lib/trackStyle";
+import RingOptionsEditor from "./RingOptionsEditor";
+import type { RingModule } from "../lib/rings/types";
 import type { ScaleType, ShadeStyle, TrackConfig } from "../lib/types";
 
 type EditColor = (title: string, color: string, apply: (c: string) => void) => void;
@@ -165,8 +167,13 @@ const gradientCss = (stops: string[]) =>
 
 export default function TrackStylePanel({
   track, colorMap, numericColumns, stats, palettes, selectedPalette, setSelectedPalette, applyPalette,
-  onPatch, onEditCategory, editColor,
+  onPatch, onEditCategory, editColor, ringModule, columns, categories, categoryColor,
 }: {
+  /** Set for multi-column rings (heatmap, domains …): their options come from the module schema. */
+  ringModule?: RingModule;
+  columns?: Array<{ key: string; label: string; numeric: boolean }>;
+  categories?: (optKey: string) => string[];
+  categoryColor?: (optKey: string, cat: string) => string | undefined;
   track: TrackConfig;
   colorMap: Map<string, string> | undefined;
   /** Columns with numeric values, for "shade by" */
@@ -180,6 +187,25 @@ export default function TrackStylePanel({
   onEditCategory: (category: string) => void;
   editColor: EditColor;
 }) {
+  // ---------------- Multi-column ring types ----------------
+  if (ringModule && ringModule.kind !== "column") {
+    return (
+      <div className="style-panel">
+        <RingFrame track={track} onPatch={onPatch} editColor={editColor} />
+        <div className="note" style={{ fontStyle: "italic" }}>{ringModule.description}</div>
+        <RingOptionsEditor
+          ring={track}
+          module={ringModule}
+          columns={columns ?? []}
+          categories={categories ?? (() => [])}
+          categoryColor={categoryColor}
+          onPatch={onPatch}
+          editColor={editColor}
+        />
+      </div>
+    );
+  }
+
   // ---------------- Continuous ----------------
   if (track.type === "continuous") {
     const cs = contStyle(track);

@@ -644,3 +644,25 @@ select {
 /* Colour editing: hide dialogs and dimming while the screen eyedropper samples */
 .eyedropping .modal-backdrop { background: transparent; }
 .eyedropping .modal-content { visibility: hidden; }
+
+/* Multi-column rings */
+.ring-kind-chip {
+  font-size: 11px;
+  background: #eef2f7;
+  border: 1px solid #d6dde8;
+  border-radius: 3px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+.add-ring-form {
+  margin-top: 6px;
+  padding: 6px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #fff;
+}
+
+/* Tree decorations panel */
+.decor-panel .style-row { margin-bottom: 4px; }
+.decor-label { min-width: 92px; }
+.decor-heading { font-weight: 600; margin: 8px 0 4px; }

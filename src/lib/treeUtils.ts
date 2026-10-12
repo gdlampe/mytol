@@ -130,6 +130,10 @@ export function buildTree(ast: any): Tree {
       }
     }
 
+    // Non-numeric internal labels (clade names) are kept separately from `name`
+    // (which is leaf-only) so annotation rows and connections can refer to them.
+    if (!node.isLeaf && a.name && node.support === undefined) node.label = String(a.name);
+
     nodes.push(node);
     if (node.name) nameToNode.set(node.name, id);
 

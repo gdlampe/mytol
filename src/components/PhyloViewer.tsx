@@ -55,7 +55,20 @@ import {
   layoutUnrootedEqualAngle,
   rectToPolar,
 } from "../lib/treeLayout";
-import { parseAnnotations } from "../lib/parseAnnotations";
+import { parseAnnotations, parseAnnotationFile } from "../lib/parseAnnotations";
+import type { Connection } from "../lib/parseAnnotations";
+import {
+  DEFAULT_DECOR,
+  computeNodeColors,
+  connectionControl,
+  internalNodeRows,
+  labelStyleOf,
+  nodeNameIndex,
+  resolveNodeRef,
+  uniformClades,
+} from "../lib/decorations";
+import type { TreeDecor } from "../lib/decorations";
+import { FIELD_PALETTE } from "../lib/rings/util";
 import {
   NO_VALUE,
   cellValue,
@@ -80,6 +93,12 @@ import {
   DEFAULT_SHADE_LOW,
 } from "../lib/trackStyle";
 import type { Painter, StyleClip } from "../lib/trackStyle";
+import { canvasBand, svgBand } from "../lib/rings/band";
+import type { BandOut } from "../lib/rings/band";
+import type { RingKind, Slot } from "../lib/rings/types";
+import { SHAPE_CHOICES } from "../lib/rings/types";
+import AddRingForm from "./AddRingForm";
+import { RING_MODULES, isColumnRing, ringModule, ringWidth } from "../lib/rings";
 
 // ============================================================
 // Categorical colour palettes
@@ -222,8 +241,14 @@ export default function Phylo() {
   // Loaded annotation files. Each contributes its rows/columns to the merged
   // annotation map; users can stack multiple files and close them individually.
   const [annotationFiles, setAnnotationFiles] = useState<
-    Array<{ name: string; rows: AnnotationRow[]; columns: string[] }>
+    Array<{ name: string; rows: AnnotationRow[]; columns: string[]; note?: string }>
   >([]);
+  // Connection files (source/target tables) and column-driven tree decorations.
+  const [connectionFiles, setConnectionFiles] = useState<Array<{ name: string; connections: Connection[] }>>([]);
+  const [decor, setDecor] = useState<TreeDecor>(DEFAULT_DECOR);
+  const patchDecor = (patch: Partial<TreeDecor>) => setDecor(d => ({ ...d, ...patch }));
+  const [cladeCol, setCladeCol] = useState<string | null>(null);
+  const [cladeMin, setCladeMin] = useState(3);
 
   // Bug fix: store raw text so ladderize changes don't re-read from disk
   const [newickText, setNewickText] = useState<string | null>(null);
@@ -233,6 +258,8 @@ export default function Phylo() {
     new Map()
   );
   const [trackConfig, setTrackConfig] = useState<TrackConfig[]>([]);
+  // The one-column rings, i.e. the annotation columns (multi-column rings excluded).
+  const columnRings = useMemo(() => trackConfig.filter(isColumnRing), [trackConfig]);
   const [showTracks, setShowTracks] = useState(true);
   const [colorMaps, setColorMaps] = useState<Map<string, Map<string, string>>>(
     new Map()
@@ -391,7 +418,7 @@ export default function Phylo() {
   const [panelVisible, setPanelVisible] = useState(true);
   const [sectionOpen, setSectionOpen] = useState({
     files: true, export: false, ranges: false, layout: true, tree: true, tracks: false, support: false, options: false,
-    annSearch: true, legend: false,
+    annSearch: true, legend: false, decor: false,
   });
   const toggleSection = (key: keyof typeof sectionOpen) =>
     setSectionOpen((s) => ({ ...s, [key]: !s[key] }));
@@ -448,21 +475,14 @@ export default function Phylo() {
     return layoutUnrootedEqualAngle(tree, !phylogram);
   }, [tree, phylogram]);
 
-  // Per-node branch width. Taper: width ∝ (cladeSize/N)^0.3, min 0.5×.
-  // Memoised — only recomputes when tree topology or thickness options change, not on every pan/zoom.
-  const nodeWidthPx = useMemo(() => {
-    if (!tree) return new Float32Array(0);
-    const { nodes, leaves } = tree;
-    const N_leaves = leaves.length || 1;
-    const arr = new Float32Array(nodes.length);
-    for (let i = 0; i < nodes.length; i++) {
-      const nd = nodes[i];
-      arr[i] = optTaperBranches
-        ? optBranchThickness * Math.max(0.5, Math.pow((nd.R - nd.L) / N_leaves, 0.3))
-        : optBranchThickness;
-    }
-    return arr;
-  }, [tree, optTaperBranches, optBranchThickness]);
+  // Leaves in equal-angle branch-direction order (ring order in the unrooted layout).
+  const unrootedLeafOrder = useMemo(() => {
+    if (!tree || !unrootedLayout) return [] as number[];
+    const c = unrootedLayout.coords;
+    return [...tree.leaves].sort((a, b) => c[a].angle - c[b].angle);
+  }, [tree, unrootedLayout]);
+
+
 
   // ==========================================================
   // Data loading
@@ -565,14 +585,16 @@ export default function Phylo() {
 
     // Per-column type detection on merged rows.
     const rowsList = [...map.values()];
-    const colMeta = new Map<string, { isContinuous: boolean; maxVal: number; cats: Set<string> }>();
+    const colMeta = new Map<string, { isContinuous: boolean; maxVal: number; cats: Set<string>; filled: number }>();
     for (const col of allColumns) {
       let isContinuous = true;
       let maxVal = -Infinity;
+      let filled = 0;
       const cats = new Set<string>();
       for (const r of rowsList) {
         const val = r[col];
         if (val === null || val === undefined || val === "") continue;
+        filled++;
         if (isContinuous) {
           const num = Number(val);
           if (isNaN(num)) isContinuous = false;
@@ -582,7 +604,7 @@ export default function Phylo() {
         // non-numeric one still need colours if the column is categorical.
         cats.add(val.toString());
       }
-      colMeta.set(col, { isContinuous, maxVal: maxVal > 0 ? maxVal : 1, cats });
+      colMeta.set(col, { isContinuous, maxVal: maxVal > 0 ? maxVal : 1, cats, filled });
     }
 
     // Styles of deleted columns that are being restored (snapshot: the
@@ -592,11 +614,14 @@ export default function Phylo() {
     setTrackConfig(prev => {
       const prevByKey = new Map(prev.map(t => [t.key, t]));
       // Keep the user's ring order for existing columns; new columns go last, in file order.
+      // Multi-column rings (heatmaps etc.) are not tied to one column: keep them in place.
       const ordered = [
-        ...prev.map(t => t.key).filter(k => colMeta.has(k)),
+        ...prev.map(t => t.key).filter(k => colMeta.has(k) || !isColumnRing(prevByKey.get(k)!)),
         ...allColumns.filter(c => !prevByKey.has(c)),
       ];
       return ordered.map(col => {
+        const kept = prevByKey.get(col);
+        if (kept && !isColumnRing(kept)) return kept;
         const meta = colMeta.get(col)!;
         const existing = prevByKey.get(col) ?? restoring.get(col)?.track;
         const desiredType = meta.isContinuous ? "continuous" : "categorical";
@@ -618,7 +643,10 @@ export default function Phylo() {
         if (meta.isContinuous) {
           return { key: col, label: col, type: "continuous" as const, height: 20, maxVal: meta.maxVal, visible: true };
         }
-        return { key: col, label: col, type: "categorical" as const, height: 8, visible: true };
+        // Mostly-unique text (sequences, domain strings, value lists, free text)
+        // makes a useless colour strip: start hidden; use it in a multi-column ring instead.
+        const idLike = meta.cats.size > 100 && meta.cats.size > 0.3 * meta.filled;
+        return { key: col, label: col, type: "categorical" as const, height: 8, visible: !idLike };
       });
     });
 
@@ -639,7 +667,7 @@ export default function Phylo() {
     });
 
     // Clear legend/colour-editor selections if their column went away.
-    setShowLegendKey(prev => (prev && seenCols.has(prev) ? prev : null));
+    setShowLegendKey(prev => (prev && (seenCols.has(prev) || prev.startsWith("ring:")) ? prev : null));
     setEditingColor(prev => (prev && seenCols.has(prev.trackKey) ? prev : null));
     // Keep the user's choice (including Manual) while its column exists;
     // otherwise default to the first categorical column.
@@ -665,13 +693,17 @@ export default function Phylo() {
   // parsed onto the file list in the order given (one update) — the effect
   // above rebuilds derived state.
   const addAnnotationFiles = async (files: File[]) => {
-    const results = await Promise.allSettled(files.map(f => parseAnnotations(f)));
-    const added: Array<{ name: string; rows: AnnotationRow[]; columns: string[] }> = [];
+    const results = await Promise.allSettled(files.map(f => parseAnnotationFile(f)));
+    const added: Array<{ name: string; rows: AnnotationRow[]; columns: string[]; note?: string }> = [];
+    const conns: Array<{ name: string; connections: Connection[] }> = [];
     results.forEach((r, i) => {
-      if (r.status === "fulfilled") added.push({ name: files[i].name, ...r.value });
-      else console.error(`Failed to parse annotations (${files[i].name}):`, r.reason);
+      if (r.status !== "fulfilled") { console.error(`Failed to parse annotations (${files[i].name}):`, r.reason); return; }
+      const p = r.value;
+      if (p.kind === "connections") conns.push({ name: files[i].name, connections: p.connections });
+      else added.push({ name: files[i].name, rows: p.rows, columns: p.columns, note: p.note });
     });
     if (added.length) setAnnotationFiles(prev => [...prev, ...added]);
+    if (conns.length) setConnectionFiles(prev => [...prev, ...conns]);
   };
 
   const removeAnnotationFile = (idx: number) => {
@@ -682,7 +714,7 @@ export default function Phylo() {
   // Annotation search — find leaves by the value of one column
   // ==========================================================
 
-  const annSearchTrack = trackConfig.find(t => t.key === annSearchKey) ?? null;
+  const annSearchTrack = columnRings.find(t => t.key === annSearchKey) ?? null;
 
   // Switching column starts a blank query. (Done here rather than in an effect
   // on annSearchKey so a session load can restore key and query together.)
@@ -696,9 +728,9 @@ export default function Phylo() {
 
   // Keep the chosen column valid as annotation files come and go.
   useEffect(() => {
-    if (annSearchKey !== null && trackConfig.some(t => t.key === annSearchKey)) return;
-    chooseAnnSearchKey(trackConfig[0]?.key ?? null);
-  }, [trackConfig, annSearchKey]);
+    if (annSearchKey !== null && columnRings.some(t => t.key === annSearchKey)) return;
+    chooseAnnSearchKey(columnRings[0]?.key ?? null);
+  }, [columnRings, annSearchKey]);
 
   // Distinct values (with leaf counts) of a categorical column among the tree's
   // leaves; only computed while the search section is open.
@@ -844,7 +876,7 @@ export default function Phylo() {
   // ==========================================================
 
   // Categories present among the tree's current leaves, per categorical track.
-  const catTrackKeysSig = trackConfig.filter(t => t.type === "categorical").map(t => t.key).join("\x00");
+  const catTrackKeysSig = columnRings.filter(t => t.type === "categorical").map(t => t.key).join("\x00");
   const presentCategories = useMemo(() => {
     const m = new Map<string, Set<string>>();
     if (!tree || !catTrackKeysSig) return m;
@@ -866,16 +898,154 @@ export default function Phylo() {
   // Numeric stats for every column (drive value scales) and one painter per
   // ring — shared by all canvas and SVG renderers and by the legend.
   // Sorted: reordering rings must not trigger a full re-scan of the rows.
-  const trackKeysSig = trackConfig.map(t => t.key).sort().join("\x00");
+  const trackKeysSig = columnRings.map(t => t.key).sort().join("\x00");
   const numStats = useMemo(
     () => numericStats(annotations.values(), trackKeysSig ? trackKeysSig.split("\x00") : []),
     [annotations, trackKeysSig]
   );
-  const trackPainters = useMemo(() => {
-    const m = new Map<string, Painter>();
-    for (const t of trackConfig) m.set(t.key, makeTrackPainter(t, colorMaps.get(t.key), numStats));
-    return m;
-  }, [trackConfig, colorMaps, numStats]);
+  // Hover lines for one leaf's annotation row: every visible ring's value(s).
+  const ringTooltipLines = (row: AnnotationRow | undefined): string[] => {
+    const lines: string[] = [];
+    for (const t of trackConfig) {
+      if (!t.visible) continue;
+      if (isColumnRing(t)) { lines.push(`${t.label}: ${row?.[t.key] || "N/A"}`); continue; }
+      const m = ringModule(t);
+      if (m.tooltip) lines.push(...m.tooltip(t, row, ringInfo));
+      else for (const fk of t.fields ?? []) lines.push(`${columnLabel(fk)}: ${row?.[fk] || "N/A"}`);
+    }
+    return lines;
+  };
+
+  // Display name of a column: its ring's label (or the key).
+  const columnLabel = (key: string) => columnRings.find(t => t.key === key)?.label ?? key;
+
+  // Every annotation row (stable identity per annotation change) and the
+  // context ring modules use for legends, tooltips and data-dependent widths.
+  const annotationRows = useMemo(() => [...annotations.values()], [annotations]);
+  const ringInfo = { stats: numStats, colorMaps, columnLabel, rows: annotationRows, fontScale: optFontScale };
+
+  // ==========================================================
+  // Tree decorations from annotation columns
+  // ==========================================================
+
+  // Named nodes (leaves + named internal nodes) and rows attached to clades ("A|B" ids).
+  const decorNodeIndex = useMemo(() => (tree ? nodeNameIndex(tree) : new Map<string, number>()), [tree]);
+  const internalRows = useMemo(
+    () => (tree ? internalNodeRows(tree, annotationRows, decorNodeIndex) : new Map<number, AnnotationRow>()),
+    [tree, annotationRows, decorNodeIndex]
+  );
+  const leafRow = (leafId: number) => (tree ? annotations.get(tree.nodes[leafId].name || "") : undefined);
+  const nodeRow = (id: number) => (tree && tree.nodes[id].isLeaf ? leafRow(id) : internalRows.get(id));
+
+  // Colour of a cell in column `key`: its category colour, or (numbers) its ring's gradient.
+  const columnColorFn = (key: string | null): ((row: AnnotationRow | undefined) => string | null) | null => {
+    if (!key) return null;
+    const ring = columnRings.find(t => t.key === key);
+    if (!ring) return null;
+    const asGradient = ring.type === "continuous" ? { ...ring, cont: { ...contStyle(ring), mode: "gradient" as const } } : ring;
+    const paint = makeTrackPainter(asGradient, colorMaps.get(key), numStats);
+    return (row) => paint(row)?.color ?? null;
+  };
+
+  // Branch colours by column (null = not set).
+  const decorBranchColors = useMemo(() => {
+    if (!tree || !decor.branchColorBy) return null;
+    const f = columnColorFn(decor.branchColorBy);
+    if (!f) return null;
+    return computeNodeColors(tree, leafRow, internalRows, f, decor.branchColorMode);
+  }, [tree, decor.branchColorBy, decor.branchColorMode, internalRows, annotations, columnRings, colorMaps, numStats]);
+
+  // Per-node branch width. Taper: width ∝ (cladeSize/N)^0.3, min 0.5×; optionally
+  // scaled 1–3× by a numeric column (leaves and clade rows).
+  const nodeWidthPx = useMemo(() => {
+    if (!tree) return new Float32Array(0);
+    const { nodes, leaves } = tree;
+    const N_leaves = leaves.length || 1;
+    const arr = new Float32Array(nodes.length);
+    for (let i = 0; i < nodes.length; i++) {
+      const nd = nodes[i];
+      arr[i] = optTaperBranches
+        ? optBranchThickness * Math.max(0.5, Math.pow((nd.R - nd.L) / N_leaves, 0.3))
+        : optBranchThickness;
+    }
+    const wcol = decor.branchWidthBy;
+    const st = wcol ? numStats.get(wcol) : undefined;
+    if (wcol && st && st.count > 0 && st.max > 0) {
+      for (let i = 0; i < nodes.length; i++) {
+        const v = Number(nodes[i].isLeaf ? annotations.get(nodes[i].name || "")?.[wcol] : internalRows.get(i)?.[wcol]);
+        if (Number.isFinite(v) && v > 0) arr[i] *= 1 + 2 * Math.min(1, v / st.max);
+      }
+    }
+    return arr;
+  }, [tree, optTaperBranches, optBranchThickness, decor.branchWidthBy, numStats, annotations, internalRows]);
+
+  // Leaf label decorations.
+  const decorLabelColorFn = useMemo(() => columnColorFn(decor.labelColorBy), [decor.labelColorBy, columnRings, colorMaps, numStats]);
+  const decorLabelBgFn = useMemo(() => columnColorFn(decor.labelBgBy), [decor.labelBgBy, columnRings, colorMaps, numStats]);
+  const labelText = (leafId: number, name: string) => {
+    if (!decor.labelRenameBy) return name;
+    const v = leafRow(leafId)?.[decor.labelRenameBy];
+    return v === undefined || v === null || v === "" ? name : String(v);
+  };
+  const labelStyle = (leafId: number) => {
+    if (!decor.labelStyleBy) return null;
+    const st = labelStyleOf(leafRow(leafId)?.[decor.labelStyleBy]);
+    return st.bold || st.italic ? st : null;
+  };
+
+  // Clades for "Clades from a column" (memoised: the panel re-renders on every hover).
+  const uniformCladeList = useMemo(() => {
+    if (!tree || !cladeCol) return [];
+    return uniformClades(tree, id => {
+      const v = annotations.get(tree.nodes[id].name || "")?.[cladeCol];
+      return v === undefined || v === null || v === "" ? null : String(v);
+    }, cladeMin);
+  }, [tree, annotations, cladeCol, cladeMin]);
+
+  // Connections resolved to node ids.
+  const resolvedConnections = useMemo(() => {
+    const out: Array<{ a: number; b: number; c: Connection; width: number }> = [];
+    if (!tree) return out;
+    for (const f of connectionFiles) {
+      // Weights are relative: drawn 0.5–3× the default width across the file's range.
+      let maxW = 0;
+      for (const c of f.connections) if (c.weight !== undefined && c.weight > maxW) maxW = c.weight;
+      for (const c of f.connections) {
+        const a = resolveNodeRef(tree, decorNodeIndex, c.source), b = resolveNodeRef(tree, decorNodeIndex, c.target);
+        if (a === null || b === null) continue;
+        const w = c.width ?? (c.weight !== undefined && maxW > 0 ? decor.connWidth * (0.5 + 2.5 * Math.max(0, c.weight) / maxW) : decor.connWidth);
+        out.push({ a, b, c, width: Math.max(0.25, w) });
+      }
+    }
+    return out;
+  }, [tree, connectionFiles, decorNodeIndex, decor.connWidth]);
+
+  // Largest row total over the node-pie columns (pies sized by total).
+  const pieMaxTotal = useMemo(() => {
+    let maxTotal = 0;
+    if (!decor.pieScaled || !decor.pieFields.length) return 0;
+    for (const row of annotationRows) {
+      let t = 0;
+      for (const fk of decor.pieFields) { const n = Number(row[fk]); if (Number.isFinite(n) && n > 0) t += n; }
+      if (t > maxTotal) maxTotal = t;
+    }
+    return maxTotal;
+  }, [annotationRows, decor.pieFields, decor.pieScaled]);
+
+  // Drop decoration settings that point at columns which no longer exist.
+  useEffect(() => {
+    const has = (k: string | null) => k === null || columnRings.some(t => t.key === k);
+    const keys = ["branchColorBy", "branchWidthBy", "labelColorBy", "labelBgBy", "labelRenameBy", "labelStyleBy", "symbolBy"] as const;
+    const bad = keys.filter(k => !has(decor[k]));
+    const pies = decor.pieFields.filter(k => has(k));
+    if (bad.length || pies.length !== decor.pieFields.length) {
+      setDecor(d => {
+        const next = { ...d, pieFields: d.pieFields.filter(k => has(k)) };
+        for (const k of bad) next[k] = null;
+        return next;
+      });
+    }
+  }, [columnRings]);
 
   // Every possible legend section with all of its entries, in the user's
   // order (legendOrder / legendEntryOrder). Exclusion, hidden entries and the
@@ -884,13 +1054,25 @@ export default function Phylo() {
     if (!tree) return [];
     const text = (id: string, fallback: string) => legendLabels[id] ?? fallback;
     const sections: LegendSection[] = [];
-    const colLabel = (key: string) => trackConfig.find(t => t.key === key)?.label ?? key;
+    const colLabel = columnLabel;
 
     // One section per visible annotation ring.
     if (showTracks) {
       for (const t of trackConfig) {
         if (!t.visible) continue;
         const sid = `track:${t.key}`;
+        if (!isColumnRing(t)) {
+          // Multi-column rings describe themselves; their swatch entries can be reordered too.
+          const secs = ringModule(t).legend?.(t, ringInfo) ?? [];
+          for (const sec of secs) {
+            // The main section's title is the ring name (renamed via the ring); sub-sections and entries take legend overrides.
+            const title = sec.id === sid ? sec.title : text(sec.id, sec.title);
+            sections.push(sec.kind === "swatches"
+              ? { ...sec, title, entries: applyOrder(sec.entries.map(e => ({ ...e, label: text(e.id, e.label) })), e => e.id, legendEntryOrder[sec.id]) }
+              : { ...sec, title });
+          }
+          continue;
+        }
         if (t.type === "categorical") {
           const cmap = colorMaps.get(t.key);
           if (!cmap) continue;
@@ -945,6 +1127,35 @@ export default function Phylo() {
       sections.push({ id: "ranges", title: text("ranges", "Coloured ranges"), kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder["ranges"]), more: 0 });
     }
 
+    // Node symbols: one entry per category (shape in its colour).
+    const symRing = decor.symbolBy ? columnRings.find(t => t.key === decor.symbolBy) : undefined;
+    if (decor.symbolBy && symRing && symRing.type === "continuous") {
+      // Numeric symbol column: symbols use its gradient, so show that ramp.
+      const cs = { ...contStyle(symRing), mode: "gradient" as const };
+      const sc = makeValueScale(cs, numStats.get(symRing.key));
+      const { lo, hi } = scaleLabel(sc);
+      sections.push({
+        id: "decor:symbols", title: text("decor:symbols", colLabel(decor.symbolBy)), kind: "ramp", min: lo, max: hi,
+        style: "gradient", color: cs.barColor, stops: cs.stops.map(color => ({ color, opacity: 1 })),
+        note: sc.log ? `${logBaseName(sc.base)} scale` : undefined, ticks: scaleTicks(sc),
+      });
+    } else if (decor.symbolBy) {
+      const cmap = colorMaps.get(decor.symbolBy);
+      const sid = "decor:symbols";
+      const entries: LegendEntry[] = cmap
+        ? [...cmap].map(([cat, color]) => ({ id: `${sid}\x00${cat}`, label: text(`${sid}\x00${cat}`, cat), color, fillAlpha: 1, shape: decor.symbolShape, hollow: !decor.symbolFilled }))
+        : [{ id: `${sid}\x00all`, label: text(`${sid}\x00all`, colLabel(decor.symbolBy)), color: "#333", fillAlpha: 1, shape: decor.symbolShape, hollow: !decor.symbolFilled }];
+      sections.push({ id: sid, title: text(sid, colLabel(decor.symbolBy)), kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder[sid]), more: 0 });
+    }
+    // Node pies: one swatch per field.
+    if (decor.pieFields.length) {
+      const sid = "decor:pies";
+      const entries: LegendEntry[] = decor.pieFields.map((fk, i) => ({
+        id: `${sid}\x00${fk}`, label: text(`${sid}\x00${fk}`, colLabel(fk)), color: FIELD_PALETTE[i % FIELD_PALETTE.length], fillAlpha: 1, shape: "circle" as const,
+      }));
+      sections.push({ id: sid, title: text(sid, "Node pie charts"), kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder[sid]), more: 0 });
+    }
+
     if (optSupportColouring && treeHasSupport) {
       const fmt = (v: number) => (supportAsPercent ? v.toFixed(0) : String(+v.toFixed(2)));
       sections.push({
@@ -958,7 +1169,8 @@ export default function Phylo() {
     return applyOrder(sections, sec => sec.id, legendOrder);
   }, [
     tree, legendLabels, legendOnlyPresent, legendOrder, legendEntryOrder,
-    showTracks, trackConfig, colorMaps, presentCategories, numStats,
+    showTracks, trackConfig, colorMaps, presentCategories, numStats, annotationRows, columnRings,
+    decor.symbolBy, decor.symbolShape, decor.symbolFilled, decor.pieFields,
     ranges, rangeDisplayMode,
     optSupportColouring, treeHasSupport, supportAsPercent,
     supportC0, supportC1, supportC2, supportV0, supportV1, supportV2,
@@ -974,7 +1186,7 @@ export default function Phylo() {
       const shown = sec.entries.filter(e => !legendHiddenEntries.has(e.id));
       if (!shown.length) continue;
       const entries = shown.slice(0, LEGEND_MAX_ENTRIES);
-      sections.push({ ...sec, entries, more: shown.length - entries.length });
+      sections.push({ ...sec, entries, more: (sec.more ?? 0) + shown.length - entries.length });
     }
     return { title: legendTitle, sections };
   }, [tree, legendShow, legendCatalog, legendExcluded, legendHiddenEntries, legendTitle]);
@@ -1000,9 +1212,9 @@ export default function Phylo() {
     if (!showTracks) return 0;
     return d3.sum(
       trackConfig.filter((t) => t.visible),
-      (t) => t.height + trackGap(t)
+      (t) => ringWidth(t, ringInfo) + trackGap(t)
     );
-  }, [trackConfig, showTracks]);
+  }, [trackConfig, showTracks, ringInfo]);
 
   // ==========================================================
   // Track positioning helpers (auto/manual)
@@ -1076,32 +1288,276 @@ export default function Phylo() {
     return { trackStartRadius, trackOuterRadius: trackStartRadius + trackWorldWidth };
   }
 
-  // Ring cells for the circular layout: one per sampled leaf (every leafStep-th),
-  // spanning exactly that leaf's slot of the arc — so cells are centred on their
-  // leaf and abut their neighbours — narrowed or widened by optBarFill.
-  // Cells outside `win` (if given) are dropped before their annotation lookup.
-  function circularRingCells(
-    N: number,
-    leafStep: number,
-    skipNode: Uint8Array,
-    win?: PolarWindow
-  ): Array<{ lo: number; hi: number; row: AnnotationRow | undefined }> {
-    const cells: Array<{ lo: number; hi: number; row: AnnotationRow | undefined }> = [];
-    if (!tree) return cells;
+  // Per-node colour from coloured ranges in "branches" display mode
+  // (largest range first, so the innermost range wins).
+  function rangeBranchColors(tr: Tree): Map<number, string> {
+    const m = new Map<number, string>();
+    if (rangeDisplayMode !== "branches" || ranges.length === 0) return m;
+    const sorted = [...ranges]
+      .filter(r => tr.nodes[r.nodeId])
+      .sort((a, b) => (tr.nodes[b.nodeId].R - tr.nodes[b.nodeId].L) - (tr.nodes[a.nodeId].R - tr.nodes[a.nodeId].L));
+    for (const r of sorted) {
+      const stk = [r.nodeId];
+      while (stk.length) {
+        const id = stk.pop()!;
+        m.set(id, r.color);
+        for (const ch of tr.nodes[id].children) stk.push(ch);
+      }
+    }
+    return m;
+  }
+
+  // ---------------- Node decorations (connections, pies, symbols) ----------------
+  // Drawn into a BandOut with an identity mapping (band u = screen y, v = screen x),
+  // so canvas and SVG share the code. nodeScreen gives a node's screen point.
+  function renderDecorations(
+    out: BandOut,
+    strokeCurve: (p: [number, number], q: [number, number], cp: [number, number] | null, color: string, width: number, dashed: boolean, alpha: number, cp2?: [number, number]) => void,
+    nodeScreen: (id: number) => [number, number] | null,
+    W: number, H: number, center: [number, number], mode: "rect" | "radial",
+    leafFrom: number, leafTo: number,
+    /** Approximate screen distance between neighbouring leaves (for level of detail). */
+    leafPx: number
+  ) {
+    if (!tree) return;
+    const onScreen = (p: [number, number], m: number) => p[0] >= -m && p[0] <= W + m && p[1] >= -m && p[1] <= H + m;
+    // A node hidden inside a collapsed clade is represented by that clade.
+    const shown = (id: number): number | null => {
+      let u: number | null = id;
+      while (u !== null && nodeScreen(u) === null) u = tree.nodes[u].parent;
+      return u;
+    };
+
+    // Connections (over the tree).
+    if (decor.connShow && resolvedConnections.length) {
+      for (const { a: a0, b: b0, c, width } of resolvedConnections) {
+        const a = shown(a0), b = shown(b0);
+        if (a === null || b === null) continue;
+        const p = nodeScreen(a), q = nodeScreen(b);
+        if (!p || !q) continue;
+        const color = c.color || decor.connColor;
+        if (a === b) {
+          if (a0 !== b0) continue; // both ends inside the same collapsed clade
+          // Self-connection: a teardrop loop pointing away from the centre / root.
+          const r = 10;
+          if (!onScreen(p, r * 3)) continue;
+          let o: [number, number] = mode === "rect" ? [1, 0] : [p[0] - center[0], p[1] - center[1]];
+          const ol = Math.hypot(o[0], o[1]) || 1;
+          o = [o[0] / ol, o[1] / ol];
+          const nrm: [number, number] = [-o[1], o[0]];
+          strokeCurve(p, p,
+            [p[0] + r * (2 * o[0] + 1.2 * nrm[0]), p[1] + r * (2 * o[1] + 1.2 * nrm[1])],
+            color, width, !!c.dashed, decor.connOpacity,
+            [p[0] + r * (2 * o[0] - 1.2 * nrm[0]), p[1] + r * (2 * o[1] - 1.2 * nrm[1])]);
+          continue;
+        }
+        const cp = connectionControl(p, q, decor.connCurve, mode, center);
+        const xs = [p[0], q[0], cp ? cp[0] : p[0]], ys = [p[1], q[1], cp ? cp[1] : p[1]];
+        if (Math.max(...xs) < -20 || Math.min(...xs) > W + 20 || Math.max(...ys) < -20 || Math.min(...ys) > H + 20) continue;
+        strokeCurve(p, q, cp, color, width, !!c.dashed, decor.connOpacity);
+        if (decor.connArrows) {
+          const from = cp ?? p;
+          const ang = Math.atan2(q[1] - from[1], q[0] - from[0]);
+          const L = 6 + width * 2;
+          out.polyline([
+            [q[1] - L * Math.sin(ang - 0.45), q[0] - L * Math.cos(ang - 0.45)],
+            [q[1], q[0]],
+            [q[1] - L * Math.sin(ang + 0.45), q[0] - L * Math.cos(ang + 0.45)],
+          ], color, Math.max(1, width));
+        }
+      }
+      out.flush();
+    }
+
+    // Nodes carrying data: leaves (rect: the visible rows), sampled so neighbouring
+    // glyphs are about a glyph apart (level of detail), plus every clade row.
+    const glyphPx = Math.max(decor.pieFields.length ? decor.pieRadius * 2 : 0, decor.symbolBy ? decor.symbolSize : 0, 1);
+    const step = Math.max(1, Math.ceil((glyphPx * 0.9) / Math.max(1e-6, leafPx)));
+    const dataNodes: number[] = [];
+    for (let i = leafFrom - (leafFrom % step); i < leafTo; i += step) if (i >= 0) dataNodes.push(tree.leaves[i]);
+    for (const id of internalRows.keys()) dataNodes.push(id);
+
+    // Node pies.
+    if (decor.pieFields.length) {
+      const fields = decor.pieFields;
+      const maxTotal = pieMaxTotal;
+      const colors = fields.map((_, i) => FIELD_PALETTE[i % FIELD_PALETTE.length]);
+      const cellPx = Math.max(2, decor.pieRadius * 1.6);
+      const taken = new Set<number>();
+      for (const id of dataNodes) {
+        const row = nodeRow(id);
+        if (!row) continue;
+        const vals = fields.map(fk => { const n = Number(row[fk]); return Number.isFinite(n) && n > 0 ? n : 0; });
+        const total = vals.reduce((x, y) => x + y, 0);
+        if (!(total > 0)) continue;
+        const p = nodeScreen(id);
+        const r = decor.pieScaled && maxTotal > 0 ? Math.max(2, decor.pieRadius * Math.sqrt(total / maxTotal)) : decor.pieRadius;
+        if (!p || !onScreen(p, r)) continue;
+        const key = Math.floor(p[0] / cellPx) * 100003 + Math.floor(p[1] / cellPx);
+        if (taken.has(key)) continue;
+        taken.add(key);
+        out.pie(p[1], p[0], r, vals, colors, "#ffffff", 0.75);
+        out.flush(); // one pie at a time, so later pies cover earlier ones
+      }
+    }
+
+    // Node symbols (thinned on a grid one symbol wide).
+    if (decor.symbolBy) {
+      const colorFn = columnColorFn(decor.symbolBy);
+      const size = decor.symbolSize;
+      const cell = Math.max(2, size * 0.9);
+      const seen = new Set<number>();
+      for (const id of dataNodes) {
+        const row = nodeRow(id);
+        const v = row?.[decor.symbolBy];
+        if (v === undefined || v === null || v === "") continue;
+        const p = nodeScreen(id);
+        if (!p || !onScreen(p, size)) continue;
+        const key = Math.floor(p[0] / cell) * 100003 + Math.floor(p[1] / cell);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const color = colorFn?.(row) ?? "#333";
+        out.shape(decor.symbolShape, p[1], p[0], size, decor.symbolFilled ? color : null, decor.symbolFilled ? "rgba(0,0,0,0.4)" : color, decor.symbolFilled ? 0.5 : 1.5);
+      }
+      out.flush();
+    }
+  }
+
+  function drawDecorations(
+    ctx: CanvasRenderingContext2D, nodeScreen: (id: number) => [number, number] | null,
+    W: number, H: number, center: [number, number], mode: "rect" | "radial", skipNode: Uint8Array,
+    leafFrom: number, leafTo: number, leafPx: number
+  ) {
+    void skipNode;
+    if (!decor.symbolBy && !decor.pieFields.length && !(decor.connShow && resolvedConnections.length)) return;
+    const out = canvasBand(ctx, { kind: "rect", x0: 0 });
+    renderDecorations(out, (p, q, cp, color, width, dashed, alpha, cp2) => {
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.setLineDash(dashed ? [8, 6] : []);
+      ctx.beginPath();
+      ctx.moveTo(p[0], p[1]);
+      if (cp && cp2) ctx.bezierCurveTo(cp[0], cp[1], cp2[0], cp2[1], q[0], q[1]);
+      else if (cp) ctx.quadraticCurveTo(cp[0], cp[1], q[0], q[1]);
+      else ctx.lineTo(q[0], q[1]);
+      ctx.stroke();
+      ctx.restore();
+    }, nodeScreen, W, H, center, mode, leafFrom, leafTo, leafPx);
+  }
+
+  // ---------------- Ring slots (one per sampled leaf) per layout ----------------
+  // Sampling is aligned to multiples of leafStep so it doesn't shimmer while panning.
+
+  // Rectangular: rows i0..i1 (screen px along y).
+  function rectSlots(rowY: (i: number) => number, sp: number, i0: number, i1: number, leafStep: number, skipNode: Uint8Array): Slot[] {
+    const slots: Slot[] = [];
+    if (!tree) return slots;
+    const N = tree.leaves.length;
+    for (let i = Math.max(0, i0 - (i0 % leafStep)); i < i1; i += leafStep) {
+      const leafId = tree.leaves[i];
+      if (skipNode[leafId] === 2) continue;
+      const name = tree.nodes[leafId].name || "";
+      slots.push({ leafId, name, row: annotations.get(name), lo: rowY(i) - sp / 2, hi: rowY(Math.min(i + leafStep, N)) - sp / 2 });
+    }
+    return slots;
+  }
+
+  // Circular: each sampled leaf's slot of the arc (centred on the leaf, abutting
+  // its neighbours). Slots outside `win` are dropped (tested on the extent a
+  // cell can cover, which bar fill > 1 widens).
+  function circularSlots(N: number, leafStep: number, skipNode: Uint8Array, win?: PolarWindow): Slot[] {
+    const slots: Slot[] = [];
+    if (!tree) return slots;
     const startRad = (rotation * Math.PI) / 180;
     const arcRad = (arc * Math.PI) / 180;
+    // Cull with a margin: bar fill > 1 and some ring types draw beyond their slot.
+    const grow = Math.max(1, (optBarFill * 2 - 1) / 2);
     for (let i = 0; i < tree.leaves.length; i += leafStep) {
       const leafId = tree.leaves[i];
       if (skipNode[leafId] === 2) continue;
       const hi = startRad - (i / N) * arcRad;
       const lo = startRad - (Math.min(i + leafStep, N) / N) * arcRad;
-      // Inset first, then cull on the extent actually drawn (bar fill > 1 widens cells).
-      const inset = ((hi - lo) * (1 - optBarFill)) / 2;
-      const cLo = lo + inset, cHi = hi - inset;
-      if (win && !arcInWindow(cLo, cHi, win)) continue;
-      cells.push({ lo: cLo, hi: cHi, row: annotations.get(tree.nodes[leafId].name || "") });
+      const g = (hi - lo) * grow;
+      if (win && !arcInWindow(lo - g, hi + g, win)) continue;
+      const name = tree.nodes[leafId].name || "";
+      slots.push({ leafId, name, row: annotations.get(name), lo, hi });
     }
-    return cells;
+    return slots;
+  }
+
+  // Unrooted: leaves in equal-angle branch-direction order. Each slot is centred
+  // on its leaf, reaching halfway to the neighbouring sampled leaves but never
+  // more than leafStep leaf wedges (so it doesn't spread into collapsed gaps).
+  function unrootedSlots(order: number[], coords: PolarCoord[], leafStep: number, skipNode: Uint8Array, win?: PolarWindow): Slot[] {
+    const slots: Slot[] = [];
+    const ids = order.filter(id => skipNode[id] !== 2);
+    const n = ids.length;
+    if (!n) return slots;
+    const cap = (leafStep * Math.PI) / Math.max(1, order.length);
+    const lastSampled = Math.floor((n - 1) / leafStep) * leafStep;
+    const pos = (d: number) => { while (d <= 0) d += 2 * Math.PI; return d; };
+    const grow = Math.max(1, (optBarFill * 2 - 1) / 2);
+    for (let i = 0; i < n; i += leafStep) {
+      const id = ids[i];
+      const a = coords[id].angle;
+      const nextA = i + leafStep < n ? coords[ids[i + leafStep]].angle : coords[ids[0]].angle + 2 * Math.PI;
+      const prevA = i - leafStep >= 0 ? coords[ids[i - leafStep]].angle : coords[ids[lastSampled]].angle - 2 * Math.PI;
+      const dn = n > 1 ? pos(nextA - a) : 2 * cap, dp = n > 1 ? pos(a - prevA) : 2 * cap;
+      const lo = a - Math.min(cap, dp / 2), hi = a + Math.min(cap, dn / 2);
+      const g = (hi - lo) * grow;
+      if (win && !arcInWindow(lo - g, hi + g, win)) continue;
+      const name = tree!.nodes[id].name || "";
+      slots.push({ leafId: id, name, row: annotations.get(name), lo, hi });
+    }
+    return slots;
+  }
+
+  // Draw every visible ring outward from `base` (rect: x of the stack's inner
+  // edge; polar: radius), one BandOut per ring, then its border.
+  // `range` (polar) skips rings entirely outside the visible radii.
+  function renderRingStack(
+    mk: (base: number) => BandOut,
+    base: number,
+    pxScale: number,
+    slots: Slot[],
+    uStart: number,
+    uEnd: number,
+    fullCircle: boolean,
+    range?: { min: number; max: number },
+    /** Visible depth extent of the whole stack in the same units as `base` (rect: screen x; polar: radius). */
+    visible: { min: number; max: number } = { min: -Infinity, max: Infinity }
+  ) {
+    let cur = base;
+    const borders: Array<{ start: number; w: number; ring: TrackConfig }> = [];
+    for (const ring of trackConfig) {
+      if (!ring.visible) continue;
+      const w = ringWidth(ring, ringInfo) * pxScale;
+      const start = cur;
+      cur += w + trackGap(ring) * pxScale;
+      if (range && (start + w < range.min || start > range.max)) continue;
+      if (ring.border?.show) borders.push({ start, w, ring });
+      const out = mk(start);
+      ringModule(ring).draw(ring, {
+        out, slots, width: w, scale: pxScale, barFill: optBarFill, uStart, uEnd,
+        vMin: visible.min - start, vMax: visible.max - start,
+        fontScale: optFontScale, stats: numStats, colorMaps, columnLabel, rows: annotationRows,
+      });
+      out.flush();
+    }
+    // Borders last, so the next ring's cells never cover half of a border.
+    for (const { start, w, ring } of borders) {
+      const out = mk(start);
+      const bw = ring.border!.width * pxScale;
+      if (fullCircle) {
+        out.alongLine(0, 2 * Math.PI, 0, ring.border!.color, bw);
+        out.alongLine(0, 2 * Math.PI, w, ring.border!.color, bw);
+      } else {
+        out.strokeCell(uStart, uEnd, 0, w, ring.border!.color, bw);
+      }
+      out.flush();
+    }
   }
 
   function computeUnrootedTrackRadii(
@@ -1247,30 +1703,37 @@ export default function Phylo() {
     }
 
     // Per-node range colour map for "branches" display mode.
-    // Processes ranges largest→smallest so innermost range wins.
-    const nodeRangeColor = new Map<number, string>();
-    if (rangeDisplayMode === "branches" && ranges.length > 0) {
-      const sorted = [...ranges].sort(
-        (a, b) => (nodes[b.nodeId].R - nodes[b.nodeId].L) - (nodes[a.nodeId].R - nodes[a.nodeId].L)
-      );
-      for (const r of sorted) {
-        const stk = [r.nodeId];
-        while (stk.length) {
-          const id = stk.pop()!;
-          nodeRangeColor.set(id, r.color);
-          for (const ch of nodes[id].children) stk.push(ch);
-        }
-      }
-    }
+    const nodeRangeColor = rangeBranchColors(tree);
 
     // Branch colour: range override → support colour → default
     const nodeColor = (id: number, support?: number): string =>
-      nodeRangeColor.get(id) ?? (optSupportColouring && support !== undefined ? supportColor(support) : "#333");
+      nodeRangeColor.get(id) ?? decorBranchColors?.[id] ?? (optSupportColouring && support !== undefined ? supportColor(support) : "#333");
 
-    // Leaf label colour: annotation-search match → range colour → default
+    // Leaf label colour: annotation-search match → label-colour column → range colour → default
     const matchFlag = annHighlight && annMatches ? annMatches.flag : null;
     const labelColor = (leafId: number): string =>
-      matchFlag && matchFlag[leafId] ? annHighlightColor : nodeRangeColor.get(leafId) ?? "#222";
+      matchFlag && matchFlag[leafId] ? annHighlightColor
+        : decorLabelColorFn?.(leafRow(leafId)) ?? nodeRangeColor.get(leafId) ?? "#222";
+
+    // Draw one leaf label at the current origin (already translated/rotated):
+    // renamed text, style, optional background box, colour.
+    const paintLabel = (leafId: number, name: string, fs: number, align: "left" | "right") => {
+      const text = labelText(leafId, name);
+      const st = labelStyle(leafId);
+      const baseFont = ctx.font;
+      if (st) ctx.font = `${st.italic ? "italic " : ""}${st.bold ? "bold " : ""}${fs}px sans-serif`;
+      const bg = decorLabelBgFn?.(leafRow(leafId));
+      if (bg) {
+        const w = ctx.measureText(text).width;
+        ctx.globalAlpha = decor.labelBgAlpha;
+        ctx.fillStyle = bg;
+        ctx.fillRect(align === "left" ? -fs * 0.15 : -w - fs * 0.15, -fs * 0.62, w + fs * 0.3, fs * 1.24);
+        ctx.globalAlpha = 1;
+      }
+      ctx.fillStyle = labelColor(leafId);
+      ctx.fillText(text, 0, 0);
+      if (st) ctx.font = baseFont;
+    };
 
     // ------ Highlight helpers (defined here to close over shared vars) ------
 
@@ -1664,13 +2127,12 @@ export default function Phylo() {
             const lx = labelR * Math.cos(angle);
             const ly = labelR * Math.sin(angle);
             if (!worldVisible(lx, ly)) continue;
-            ctx.fillStyle = labelColor(leafId);
             ctx.save();
             ctx.translate(lx, ly);
             const cosA = Math.cos(angle);
             if (cosA >= 0) { ctx.rotate(angle); ctx.textAlign = "left"; }
             else { ctx.rotate(angle + Math.PI); ctx.textAlign = "right"; }
-            ctx.fillText(name, 0, 0);
+            paintLabel(leafId, name, fontSize / gZoom, cosA >= 0 ? "left" : "right");
             ctx.restore();
           }
           ctx.restore();
@@ -1728,87 +2190,11 @@ export default function Phylo() {
         }
       }
 
-      // Annotation tracks — arc-segment ring.
-      // coords[leafId].angle is the equal-angle BRANCH direction: the angle at
-      // which the branch leading to this leaf points.  This is what the user
-      // perceives as the leaf's angular position (looking at the branch).  It is
-      // guaranteed non-overlapping and in the correct visual order by the
-      // equal-angle algorithm.  atan2(y,x) is the direction to the leaf TIP —
-      // different for non-radial trees and produces scrambled arc order.
-      // LOD thinning keeps this O(screen_pixels) even at 1M leaves.
-      if (showTracks) {
-        // Collect and sort by equal-angle assigned direction (visual order)
-        const sortedLeafIds = leaves
-          .filter(id => skipNode[id] !== 2)
-          .slice()
-          .sort((a, b) => coords[a].angle - coords[b].angle);
+      // Annotation rings are drawn in screen space after ctx.restore() (see below).
 
-        if (sortedLeafIds.length > 0) {
-          const arcPerLeaf = (2 * Math.PI) / sortedLeafIds.length;
-          const k = trackWorldScale();
-          let currentR = ringR;
-          // Cull by annular sector against the (padded) world viewport, so thick
-          // zoomed rings stay drawn even when their inner edge is off-screen.
-          const win = polarWindow(
-            worldXMin - worldCullMargin, worldYMin - worldCullMargin,
-            worldXMax + worldCullMargin, worldYMax + worldCullMargin
-          );
-
-          const ringBorders: Array<{ r1: number; r2: number; border: RingBorder }> = [];
-          for (const track of trackConfig) {
-            if (!track.visible) continue;
-            const r1 = currentR, r2 = r1 + track.height * k;
-            currentR += (track.height + trackGap(track)) * k;
-            if (r2 < win.rMin || r1 > win.rMax) continue;
-            if (track.border?.show) ringBorders.push({ r1, r2, border: track.border });
-            const arcPx = r1 * arcPerLeaf * gZoom;
-            const leafStep = Math.max(1, Math.floor(optLodMinPx / Math.max(arcPx, 1e-9)));
-
-            // Batch arc segments by colour — one fill() per distinct colour
-            const paint = trackPainters.get(track.key);
-            if (!paint) continue;
-            const colorSegs = new Map<string, Array<[number, number, number]>>();
-            for (let i = 0; i < sortedLeafIds.length; i += leafStep) {
-              const leafIdA = sortedLeafIds[i];
-              const leafIdB = sortedLeafIds[(i + leafStep) % sortedLeafIds.length];
-              const cell = paint(annotations.get(nodes[leafIdA].name || ""));
-              if (!cell) continue;
-
-              const a1 = coords[leafIdA].angle;
-              const a2raw = coords[leafIdB].angle;
-              const a2 = a2raw > a1 ? a2raw : a2raw + 2 * Math.PI;
-              if (!arcInWindow(a1, a2, win)) continue;
-
-              // Bars grow outward from the ring's inner edge.
-              const rOut = r1 + cell.frac * (r2 - r1);
-              if (!colorSegs.has(cell.color)) colorSegs.set(cell.color, []);
-              colorSegs.get(cell.color)!.push([a1, a2, rOut]);
-            }
-
-            for (const [color, segs] of colorSegs) {
-              ctx.fillStyle = color;
-              ctx.beginPath();
-              for (const [a1, a2, rOut] of segs) {
-                ctx.moveTo(rOut * Math.cos(a1), rOut * Math.sin(a1));
-                ctx.arc(0, 0, rOut, a1, a2, false);
-                ctx.arc(0, 0, r1, a2, a1, true);
-                ctx.closePath();
-              }
-              ctx.fill();
-            }
-          }
-          // Ring borders: full circles at each bordered ring's inner and outer edge.
-          for (const { r1, r2, border } of ringBorders) {
-            ringOutlinePath(ctx, r1, r2, 0, 0, true);
-            ctx.lineWidth = border.width * k;
-            ctx.strokeStyle = border.color;
-            ctx.stroke();
-          }
-        }
-      }
-
-      // Leaf labels (unrooted) — anchored at actual leaf tips, extending outward
-      if (showLeafLabels) {
+      // Leaf labels (unrooted) — anchored at actual leaf tips, extending outward.
+      // Deferred until after the rings (drawn in screen space later) so labels stay on top.
+      if (showLeafLabels) deferredWorldDraw = () => {
         const arcPerLeaf = N > 0 ? (2 * Math.PI) / N : 0;
         const labelSpacingPx = ringR * arcPerLeaf * gZoom;
         if (labelSpacingPx >= 6) {
@@ -1829,18 +2215,17 @@ export default function Phylo() {
             const px = lx + labelOffset * (lx / len);
             const py = ly + labelOffset * (ly / len);
             if (!worldVisible(px, py)) continue;
-            ctx.fillStyle = labelColor(leafId);
             ctx.save();
             ctx.translate(px, py);
             const cosA = Math.cos(dirAngle);
             if (cosA >= 0) { ctx.rotate(dirAngle); ctx.textAlign = "left"; }
             else { ctx.rotate(dirAngle + Math.PI); ctx.textAlign = "right"; }
-            ctx.fillText(name, 0, 0);
+            paintLabel(leafId, name, fontSize / gZoom, cosA >= 0 ? "left" : "right");
             ctx.restore();
           }
           ctx.restore();
         }
-      }
+      };
 
       // Coloured hull ranges (background mode only)
       for (const r of ranges) {
@@ -1866,6 +2251,9 @@ export default function Phylo() {
       }
     }
 
+    // World-space drawing to run after the screen-space rings (unrooted labels).
+    let deferredWorldDraw: (() => void) | null = null;
+
     // ---- Dispatch to layout-specific draw ----
 
     if (layout === "rect") {
@@ -1884,88 +2272,64 @@ export default function Phylo() {
 
     ctx.restore();
 
-    // ---- Circular layout: annotation tracks as screen-space overlay ----
-    // Drawn after ctx.restore() in screen pixels. With tracksZoomWithTree the ring
-    // radius and heights are scaled by gZoom (ring zooms with the tree); otherwise
-    // heights are constant screen pixels and the inner radius tracks the outermost
-    // visible branch (via computeCircularTrackRadii auto mode).
-    if (layout === "circular" && showTracks && effectiveTrackWidth > 0 && rectLayout) {
-      const R = Math.min(W, H) * CIRC_RADIUS_FRACTION;
-      const N = leaves.length || 1;
-      const arcRad = (arc * Math.PI) / 180;
-      const anglePerLeaf = N > 0 ? arcRad / N : 0;
+    // ---- Radial layouts: annotation rings in screen space ----
+    // Circular: the stack starts at the tree's outer edge (or, with fixed-width
+    // rings, the outermost visible branch); unrooted: around the farthest leaf.
+    // Ring widths scale with zoom when tracksZoomWithTree.
+    if (showTracks && effectiveTrackWidth > 0 && (layout === "circular" || layout === "unrooted")) {
       const cx = W / 2 + offset.x, cy = H / 2 + offset.y;
-      const { trackStartRadius } = computeCircularTrackRadii(
-        W, H, { coords: rectCoords as any[], maxX: rectMaxX }, R, N, effectiveTrackWidth
-      );
-      const trackStartR_screen = trackStartRadius * gZoom;
-      const trackPx = tracksZoomWithTree ? gZoom : 1; // screen px per track-height px
-      const trackOuterR_screen = trackStartR_screen + effectiveTrackWidth * trackPx;
-      const leafArcPx = trackStartR_screen * anglePerLeaf;
-      const leafStep = leafArcPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafArcPx)) : 1;
-
-      // Cull cells against the viewport in polar terms, so rings far wider than
-      // the screen (zoomed in) still draw exactly the visible cells.
       const pad = 50;
       const win = polarWindow(-pad - cx, -pad - cy, W + pad - cx, H + pad - cy);
-      const cells = trackOuterR_screen >= win.rMin && trackStartR_screen <= win.rMax
-        ? circularRingCells(N, leafStep, skipNode, win)
-        : [];
-
-      if (cells.length > 0) {
-        ctx.save();
-        ctx.translate(cx, cy);
-        let currentR = trackStartR_screen;
-        for (const track of trackConfig) {
-          if (!track.visible) continue;
-          const r1 = currentR, r2 = r1 + track.height * trackPx;
-          currentR += (track.height + trackGap(track)) * trackPx;
-          if (r2 < win.rMin || r1 > win.rMax) continue;
-          const paint = trackPainters.get(track.key);
-          if (!paint) continue;
-          const colorSegs = new Map<string, Array<[number, number, number]>>();
-          for (const { lo, hi, row } of cells) {
-            const cell = paint(row);
-            if (!cell) continue;
-            // Bars grow outward from the ring's inner edge.
-            const rOut = r1 + cell.frac * (r2 - r1);
-            if (!colorSegs.has(cell.color)) colorSegs.set(cell.color, []);
-            colorSegs.get(cell.color)!.push([lo, hi, rOut]);
-          }
-          for (const [color, segs] of colorSegs) {
-            ctx.fillStyle = color;
-            ctx.beginPath();
-            for (const [lo, hi, rOut] of segs) {
-              ctx.moveTo(rOut * Math.cos(lo), rOut * Math.sin(lo));
-              ctx.arc(0, 0, rOut, lo, hi, false);
-              ctx.arc(0, 0, r1, hi, lo, true);
-              ctx.closePath();
-            }
-            ctx.fill();
-          }
-        }
-        ctx.restore();
+      let r0 = 0, pxScale = 1, uStart = 0, uEnd = 0, full = true;
+      let slots: Slot[] = [];
+      if (layout === "circular" && rectLayout) {
+        const R = Math.min(W, H) * CIRC_RADIUS_FRACTION;
+        const N = leaves.length || 1;
+        const arcRad = (arc * Math.PI) / 180;
+        const { trackStartRadius } = computeCircularTrackRadii(
+          W, H, { coords: rectCoords as any[], maxX: rectMaxX }, R, N, effectiveTrackWidth
+        );
+        r0 = trackStartRadius * gZoom;
+        pxScale = tracksZoomWithTree ? gZoom : 1;
+        const leafArcPx = r0 * (arcRad / N);
+        const leafStep = leafArcPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafArcPx)) : 1;
+        const rOuter = r0 + effectiveTrackWidth * pxScale;
+        if (rOuter >= win.rMin && r0 <= win.rMax) slots = circularSlots(N, leafStep, skipNode, win);
+        uStart = (rotation * Math.PI) / 180;
+        uEnd = uStart - arcRad;
+        full = arc >= 360;
+      } else if (layout === "unrooted" && unrootedLayout) {
+        const { coords, maxR: computedMaxR } = unrootedLayout;
+        const R = (Math.min(W, H) * CIRC_RADIUS_FRACTION) / (computedMaxR || 1);
+        const { ringR } = computeUnrootedTrackRadii(W, H, { coords, maxR: computedMaxR }, R, effectiveTrackWidth);
+        r0 = ringR * gZoom;
+        pxScale = trackWorldScale() * gZoom;
+        // LOD from the leaves actually shown (collapsed clades remove many).
+        let n = 0;
+        for (const id of unrootedLeafOrder) if (skipNode[id] !== 2) n++;
+        n = n || 1;
+        const leafArcPx = r0 * ((2 * Math.PI) / n);
+        const leafStep = leafArcPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafArcPx)) : 1;
+        const rOuter = r0 + effectiveTrackWidth * pxScale;
+        if (rOuter >= win.rMin && r0 <= win.rMax) slots = unrootedSlots(unrootedLeafOrder, coords, leafStep, skipNode, win);
+        uStart = unrootedLeafOrder.length ? coords[unrootedLeafOrder[0]].angle : 0;
+        uEnd = uStart + 2 * Math.PI;
+        full = true;
       }
+      renderRingStack(
+        base => canvasBand(ctx, { kind: "polar", cx, cy, r0: base }),
+        r0, pxScale, slots, uStart, uEnd, full, { min: win.rMin, max: win.rMax }, { min: win.rMin, max: win.rMax }
+      );
+    }
 
-      // Ring borders: outline of each bordered ring along the tree's arc
-      // (drawn even when no cells are in view, e.g. zoomed into an empty stretch).
-      if (trackConfig.some(t => t.visible && t.border?.show) && trackOuterR_screen >= win.rMin && trackStartR_screen <= win.rMax) {
-        ctx.save();
-        ctx.translate(cx, cy);
-        const startRad = (rotation * Math.PI) / 180;
-        let currentR = trackStartR_screen;
-        for (const track of trackConfig) {
-          if (!track.visible) continue;
-          const r1 = currentR, r2 = r1 + track.height * trackPx;
-          currentR += (track.height + trackGap(track)) * trackPx;
-          if (!track.border?.show || r2 < win.rMin || r1 > win.rMax) continue;
-          ringOutlinePath(ctx, r1, r2, startRad - arcRad, startRad, arc >= 360);
-          ctx.lineWidth = track.border.width * trackPx;
-          ctx.strokeStyle = track.border.color;
-          ctx.stroke();
-        }
-        ctx.restore();
-      }
+    // Unrooted leaf labels over the rings (same world transform as the tree).
+    const runDeferred = deferredWorldDraw as (() => void) | null;
+    if (runDeferred) {
+      ctx.save();
+      ctx.translate(W / 2 + offset.x, H / 2 + offset.y);
+      ctx.scale(gZoom, gZoom);
+      runDeferred();
+      ctx.restore();
     }
 
     // ---- Rect layout: tracks and labels as screen-space overlay ----
@@ -1979,45 +2343,14 @@ export default function Phylo() {
 
       if (showTracks && effectiveTrackWidth > 0) {
         const leafStep = leafSpacingPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafSpacingPx)) : 1;
-        // optBarFill=1 → bars fill full leaf spacing (always abutting); <1 → gap between bars
-        const cellH = Math.max(leafSpacingPx * optBarFill, 1);
-        for (let i = visibleLeafStart; i < visibleLeafEnd; i += leafStep) {
-          const leafId = leaves[i];
-          if (skipNode[leafId] === 2) continue;
-          const screenY = H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
-          const nd = nodes[leafId];
-          const row = annotations.get(nd.name || "");
-          let currentX = overlayTrackX;
-          for (const track of trackConfig) {
-            if (!track.visible) continue;
-            const cell = trackPainters.get(track.key)?.(row);
-            if (cell) {
-              ctx.fillStyle = cell.color;
-              ctx.fillRect(currentX, screenY - cellH / 2, cell.frac * track.height, cellH);
-            }
-            currentX += track.height + trackGap(track);
-          }
-        }
-
-        // Ring borders: a box around each bordered ring's column, over all leaf rows.
-        if (trackConfig.some(t => t.visible && t.border?.show)) {
-          const rowY = (i: number) => H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
-          let currentX = overlayTrackX;
-          for (const track of trackConfig) {
-            if (!track.visible) continue;
-            if (track.border?.show) {
-              const bw = track.border.width;
-              const y0 = Math.max(rowY(0) - leafSpacingPx / 2, -bw);
-              const y1 = Math.min(rowY(leaves.length - 1) + leafSpacingPx / 2, H + bw);
-              if (y1 > y0) {
-                ctx.lineWidth = bw;
-                ctx.strokeStyle = track.border.color;
-                ctx.strokeRect(currentX, y0, track.height, y1 - y0);
-              }
-            }
-            currentX += track.height + trackGap(track);
-          }
-        }
+        const rowY = (i: number) => H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
+        const slots = rectSlots(rowY, leafSpacingPx, visibleLeafStart, visibleLeafEnd, leafStep, skipNode);
+        renderRingStack(
+          base => canvasBand(ctx, { kind: "rect", x0: base }),
+          overlayTrackX, 1, slots,
+          rowY(0) - leafSpacingPx / 2, rowY(leaves.length - 1) + leafSpacingPx / 2, false,
+          undefined, { min: -20, max: W + 20 }
+        );
       }
 
       if (showLeafLabels && leafSpacingPx >= 6) {
@@ -2032,8 +2365,10 @@ export default function Phylo() {
           const name = nodes[leafId].name;
           if (!name) continue;
           const screenY = H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
-          ctx.fillStyle = labelColor(leafId);
-          ctx.fillText(name, overlayLabelX, screenY);
+          ctx.save();
+          ctx.translate(overlayLabelX, screenY);
+          paintLabel(leafId, name, fontSize, "left");
+          ctx.restore();
         }
         ctx.restore();
       }
@@ -2103,6 +2438,34 @@ export default function Phylo() {
         ctx.fillText(barLen < 0.01 ? barLen.toExponential(1) : barLen < 1 ? barLen.toPrecision(2) : String(barLen), bx + barPx / 2, by + 7);
         ctx.restore();
       }
+    }
+
+    // ---- Tree decorations: connections, node pies, node symbols (screen space) ----
+    {
+      const cx = W / 2 + offset.x, cy = H / 2 + offset.y;
+      const N = leaves.length || 1;
+      const Rc = Math.min(W, H) * CIRC_RADIUS_FRACTION;
+      const Ru = unrootedLayout ? Rc / (unrootedLayout.maxR || 1) : 0;
+      const nodeScreen = (id: number): [number, number] | null => {
+        if (skipNode[id] === 2) return null;
+        if (layout === "rect") {
+          const a = (rectCoords as any)[id];
+          return [cx + (-W / 2 + PADDING + sx * a.x), cy + vZoom * (-H / 2 + PADDING + sy * a.y)];
+        }
+        if (layout === "circular") {
+          const a = (rectCoords as any)[id];
+          const P = rectToPolar(rectMaxX > 0 ? a.x / rectMaxX : 0, a.y, N, Rc, rotation, arc);
+          return [cx + gZoom * P.x, cy + gZoom * P.y];
+        }
+        if (!unrootedLayout) return null;
+        const p = unrootedLayout.coords[id];
+        return [cx + gZoom * p.x * Ru, cy + gZoom * p.y * Ru];
+      };
+      const leafPx = layout === "rect" ? sy * vZoom
+        : layout === "circular" ? Rc * gZoom * ((arc * Math.PI) / 180) / N
+        : Rc * gZoom * (2 * Math.PI) / N;
+      drawDecorations(ctx, nodeScreen, W, H, [cx, cy], layout === "rect" ? "rect" : "radial", skipNode,
+        layout === "rect" ? visibleLeafStart : 0, layout === "rect" ? visibleLeafEnd : leaves.length, leafPx);
     }
 
     // ---- Annotation-search matches: dots at leaf tips (screen space) ----
@@ -2242,7 +2605,8 @@ export default function Phylo() {
     optFontScale, optLodMinPx, nodeWidthPx, optBarFill,
     optBackground, optShowSupportLabels, optSupportColouring,
     rangeDisplayMode,
-    tracksZoomWithTree, trackPainters,
+    tracksZoomWithTree, numStats, unrootedLeafOrder,
+    decor, decorBranchColors, decorLabelColorFn, decorLabelBgFn, resolvedConnections, internalRows, annotationRows,
     annMatches, annHighlight, annHighlightColor, annStepTargets, annDotSize,
     legendModel, legendPos, legendFontSize, legendColumns, legendBox,
   ]);
@@ -2451,7 +2815,7 @@ export default function Phylo() {
         const name = tree.nodes[leafId].name || "";
         const row = annotations.get(name);
         tip = name;
-        if (row) for (const t of trackConfig) if (t.visible) tip += `\n${t.key}: ${row[t.key] || "N/A"}`;
+        if (row) tip += ringTooltipLines(row).map(l => `\n${l}`).join("");
       }
     } else if (layout === "circular") {
       const R = Math.min(W, H) * CIRC_RADIUS_FRACTION;
@@ -2466,7 +2830,7 @@ export default function Phylo() {
           const name = tree.nodes[leafId].name || "";
           const row = annotations.get(name);
           tip = name;
-          if (row) for (const t of trackConfig) if (t.visible) tip += `\n${t.key}: ${row[t.key] || "N/A"}`;
+          if (row) tip += ringTooltipLines(row).map(l => `\n${l}`).join("");
         }
       }
     } else if (layout === "unrooted" && unrootedLayout) {
@@ -2488,7 +2852,7 @@ export default function Phylo() {
           const name = tree.nodes[bestLeaf].name || "";
           const row = annotations.get(name);
           tip = name;
-          if (row) for (const t of trackConfig) if (t.visible) tip += `\n${t.key}: ${row[t.key] || "N/A"}`;
+          if (row) tip += ringTooltipLines(row).map(l => `\n${l}`).join("");
         }
       }
     }
@@ -2506,7 +2870,7 @@ export default function Phylo() {
         const name = nd.name || "";
         const row = annotations.get(name);
         tip = name;
-        if (row && showTracks) for (const t of trackConfig) if (t.visible) tip += `\n${t.key}: ${row[t.key] || "N/A"}`;
+        if (row && showTracks) tip += ringTooltipLines(row).map(l => `\n${l}`).join("");
         tip += "\n" + info;
       } else {
         tip = info;
@@ -2930,9 +3294,9 @@ export default function Phylo() {
     if (hit.kind === "title") {
       setLegendTitle(v);
     } else if (hit.kind === "section") {
-      if (hit.id.startsWith("track:")) {
-        // Track sections share the track's display name with the panel.
-        const key = hit.id.slice("track:".length);
+      const key = hit.id.startsWith("track:") ? hit.id.slice("track:".length) : null;
+      if (key !== null && trackConfig.some(t => t.key === key)) {
+        // A ring's main section shares the ring's display name with the panel.
         if (v) setTrackConfig(prev => prev.map(t => (t.key === key ? { ...t, label: v } : t)));
       } else {
         setOverride(hit.id);
@@ -2970,7 +3334,7 @@ export default function Phylo() {
     const newConfig = [...trackConfig];
     const track = { ...newConfig[index] };
     if (key === "type") { track.type = value; track.userType = true; }
-    if (key === "height") track.height = clamp(Number(value) || 0, 1, 100);
+    if (key === "height") track.height = clamp(Number(value) || 0, 1, 400);
     if (key === "visible") track.visible = !!value;
     if (key === "label") track.label = String(value);
     newConfig[index] = track;
@@ -2986,11 +3350,45 @@ export default function Phylo() {
     }
   };
 
+  // Column picker choices for ring options / the Add ring form.
+  const columnChoices = columnRings.map(t => ({ key: t.key, label: t.label, numeric: (numStats.get(t.key)?.count ?? 0) > 0 }));
+
+  const clipFits = (t: TrackConfig) =>
+    !!styleClip && styleClip.kind === (t.kind ?? "column") && (!isColumnRing(t) || styleClip.type === t.type);
+
+  // New multi-column ring (heatmap, domains …) over the chosen columns, added outermost.
+  const addRing = (kind: RingKind, fields: string[], label: string) => {
+    const m = RING_MODULES.find(x => x.kind === kind);
+    if (!m || fields.length === 0) return;
+    let n = 1;
+    while (trackConfig.some(t => t.key === `ring:${kind}:${n}`)) n++;
+    // Keys are never reused (legend state is keyed by them).
+    const key = `ring:${kind}:${Date.now().toString(36)}`;
+    const ring: TrackConfig = {
+      key, kind, fields, label: label.trim() || `${m.title}${n > 1 ? ` ${n}` : ""}`,
+      type: "categorical", height: 40, visible: true, opts: m.defaults(fields, ringInfo),
+    };
+    setTrackConfig(prev => [...prev, ring]);
+    setShowLegendKey(key);
+  };
+
+  // Remove a multi-column ring and forget its legend settings.
+  const removeRing = (key: string) => {
+    setTrackConfig(prev => prev.filter(t => t.key !== key));
+    const sid = `track:${key}`;
+    const mine = (id: string) => id === sid || id.startsWith(`${sid}\x00`) || id.startsWith(`${sid}:`);
+    setLegendExcluded(prev => new Set([...prev].filter(id => !mine(id))));
+    setLegendHiddenEntries(prev => new Set([...prev].filter(id => !mine(id))));
+    setLegendLabels(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => !mine(id))));
+    setLegendEntryOrder(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => !mine(id))));
+    setLegendOrder(prev => prev.filter(id => !mine(id)));
+  };
+
   const patchTrack = (key: string, patch: Partial<TrackConfig>) =>
     setTrackConfig(prev => prev.map(t => (t.key === key ? { ...t, ...patch } : t)));
 
   // Columns with numeric values (for "shade by").
-  const numericColumns = trackConfig
+  const numericColumns = columnRings
     .filter(t => (numStats.get(t.key)?.count ?? 0) > 0)
     .map(t => ({ key: t.key, label: t.label }));
 
@@ -2999,7 +3397,27 @@ export default function Phylo() {
   // Continuous: display mode, colours and scale type (this ring keeps its min/max).
   const pasteStyleTo = (t: TrackConfig) => {
     const clip = styleClip;
-    if (!clip || clip.type !== t.type) return;
+    if (!clip || !clipFits(t)) return;
+    if (!isColumnRing(t)) {
+      const m = ringModule(t);
+      const src: Record<string, any> = clip.opts ? JSON.parse(JSON.stringify(clip.opts)) : {};
+      const opts: Record<string, any> = { ...(t.opts ?? {}), ...src };
+      const tf = t.fields ?? [], sf = clip.fields ?? [];
+      for (const f of m.options) {
+        // Column choices belong to the target ring.
+        if (f.type === "column") opts[f.key] = t.opts?.[f.key] ?? null;
+        // Per-field colours/shapes follow field position.
+        if ((f.type === "fieldColors" || f.type === "fieldShapes") && src[f.key] && sf.length) {
+          const mapped: Record<string, string> = {};
+          tf.forEach((fk, i) => { const v = src[f.key][sf[i % sf.length]]; if (v !== undefined) mapped[fk] = v; });
+          opts[f.key] = mapped;
+        }
+        // Category colours merge into the target's own.
+        if (f.type === "categoryColors") opts[f.key] = { ...(t.opts?.[f.key] ?? {}), ...(src[f.key] ?? {}) };
+      }
+      patchTrack(t.key, { opts, border: clip.border ? { ...clip.border } : undefined, gap: clip.gap });
+      return;
+    }
     if (t.type === "categorical") {
       const target = colorMaps.get(t.key);
       if (!target) return;
@@ -3012,7 +3430,7 @@ export default function Phylo() {
           { ...clip, colors: clip.colors.map(([cat]) => [cat, clip.shade!.low[cat] ?? DEFAULT_SHADE_LOW] as [string, string]) },
           new Map([...target.keys()].map(k => [k, DEFAULT_SHADE_LOW]))
         );
-        const byOk = trackConfig.some(c => c.key === clip.shade!.by && c.key !== t.key);
+        const byOk = columnRings.some(c => c.key === clip.shade!.by && c.key !== t.key);
         shade = { ...clip.shade, by: byOk ? clip.shade.by : (t.shade?.by ?? ""), low: Object.fromEntries(lows) };
         if (!shade.by) shade = null;
       }
@@ -3102,6 +3520,36 @@ export default function Phylo() {
 
     const effectiveTrackW = getEffectiveTrackWidth();
     const lines: string[] = [];
+
+    // Branch colour with the canvas's precedence: range (branch mode) → branch-colour column → support → default.
+    const rangeBranch = rangeBranchColors(tree);
+    const svgBranchColor = (id: number) =>
+      rangeBranch.get(id) ?? decorBranchColors?.[id] ??
+      (optSupportColouring && tree.nodes[id].support !== undefined ? supportColor(tree.nodes[id].support!) : "#333");
+
+    // One leaf label (renamed text, colour, style, optional background box).
+    const measureCtx = canvasRef.current?.getContext("2d") ?? null;
+    const svgLabel = (leafId: number, name: string, x: number, y: number, anchor: string, rot: number, fz: number): string[] => {
+      const text = labelText(leafId, name);
+      const st = labelStyle(leafId);
+      const row = leafRow(leafId);
+      const color = annHighlight && annMatches?.flag[leafId] ? annHighlightColor : decorLabelColorFn?.(row) ?? rangeBranch.get(leafId) ?? "#222";
+      const tf = rot ? ` transform="rotate(${f(rot)},${f(x)},${f(y)})"` : "";
+      const out: string[] = [];
+      const bg = decorLabelBgFn?.(row);
+      if (bg && measureCtx) {
+        measureCtx.font = `${st?.italic ? "italic " : ""}${st?.bold ? "bold " : ""}${fz}px sans-serif`;
+        const w = measureCtx.measureText(text).width;
+        const x0 = anchor === "end" ? x - w - fz * 0.15 : x - fz * 0.15;
+        out.push(`<rect x="${f(x0)}" y="${f(y - fz * 0.62)}" width="${f(w + fz * 0.3)}" height="${f(fz * 1.24)}" fill="${bg}" fill-opacity="${decor.labelBgAlpha}"${tf}/>`);
+      }
+      const attrs = [
+        `x="${f(x)}"`, `y="${f(y)}"`, anchor !== "start" ? `text-anchor="${anchor}"` : "",
+        color !== "#222" ? `fill="${color}"` : "", st?.bold ? `font-weight="bold"` : "", st?.italic ? `font-style="italic"` : "",
+      ].filter(Boolean).join(" ");
+      out.push(`<text ${attrs}${tf}>${esc(text)}</text>`);
+      return out;
+    };
     lines.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`);
     lines.push('<rect width="100%" height="100%" fill="white"/>');
 
@@ -3152,60 +3600,44 @@ export default function Phylo() {
         }
         const a = (coords as any)[nd.id];
         const xp = nsX(a.x), yp = nsY(a.y);
-        const cP = nd.support !== undefined ? supportColor(nd.support) : "#333";
+        const cP = svgBranchColor(nd.id);
         for (const ch of nd.children) {
           if (skipNode[ch] === 2) continue;
           const b = (coords as any)[ch];
           const xc = nsX(b.x), yc = nsY(b.y);
-          const cC = tree.nodes[ch].support !== undefined ? supportColor(tree.nodes[ch].support!) : "#333";
+          const cC = svgBranchColor(ch);
           const vh = Math.abs(yc - yp);
           if (vh >= MIN_EDGE_PIXELS) {
-            if (!vPaths.has(cP)) vPaths.set(cP, []);
-            vPaths.get(cP)!.push(`M ${f(xp)},${f(Math.min(yp, yc))} v ${f(vh)}`);
+            const kP = `${cP}|${nodeWidthPx[nd.id]}`;
+            if (!vPaths.has(kP)) vPaths.set(kP, []);
+            vPaths.get(kP)!.push(`M ${f(xp)},${f(Math.min(yp, yc))} v ${f(vh)}`);
           }
           const hw = Math.abs(xc - xp);
           if (hw >= MIN_EDGE_PIXELS) {
-            if (!hPaths.has(cC)) hPaths.set(cC, []);
-            hPaths.get(cC)!.push(`M ${f(Math.min(xp, xc))},${f(yc)} h ${f(hw)}`);
+            const kC = `${cC}|${nodeWidthPx[ch]}`;
+            if (!hPaths.has(kC)) hPaths.set(kC, []);
+            hPaths.get(kC)!.push(`M ${f(Math.min(xp, xc))},${f(yc)} h ${f(hw)}`);
           }
         }
       }
       lines.push('<g id="branches">');
-      for (const [color, paths] of vPaths) lines.push(`<path stroke="${color}" stroke-width="${f(lw)}" fill="none" d="${paths.join(" ")}"/>`);
+      for (const [key, paths] of vPaths) { const [color, w] = key.split("|"); lines.push(`<path stroke="${color}" stroke-width="${f(Number(w))}" fill="none" d="${paths.join(" ")}"/>`); }
       const swH = f(lw / vZoom);
-      for (const [color, paths] of hPaths) lines.push(`<path stroke="${color}" stroke-width="${swH}" fill="none" d="${paths.join(" ")}"/>`);
+      for (const [key, paths] of hPaths) { const [color, w] = key.split("|"); lines.push(`<path stroke="${color}" stroke-width="${f(Number(w) / vZoom)}" fill="none" d="${paths.join(" ")}"/>`); }
       lines.push('</g>');
 
-      // Annotation tracks with same LOD as canvas
+      // Annotation rings (same slots, LOD and drawing code as the canvas)
       if (showTracks && effectiveTrackW > 0) {
         const leafStep = leafSpacingPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafSpacingPx)) : 1;
-        const cellH = Math.max(leafSpacingPx * optBarFill * leafStep, 1);
+        const rowY = (i: number) => H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
+        const slots = rectSlots(rowY, leafSpacingPx, visLeafStart, visLeafEnd, leafStep, skipNode);
         lines.push('<g id="annotations">');
-        let currentX = overlayTrackX;
-        for (const track of trackConfig) {
-          if (!track.visible) continue;
-          const cRects = new Map<string, string[]>();
-          for (let i = 0; i < tree.leaves.length; i += leafStep) {
-            const leafId = tree.leaves[i];
-            if (skipNode[leafId] === 2) continue;
-            const sY = H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
-            if (sY + cellH / 2 < 0 || sY - cellH / 2 > H) continue;
-            const cell = trackPainters.get(track.key)?.(annotations.get(tree.nodes[leafId].name || ""));
-            if (!cell) continue;
-            const w = cell.frac * track.height;
-            if (!cRects.has(cell.color)) cRects.set(cell.color, []);
-            cRects.get(cell.color)!.push(`M ${f(currentX)},${f(sY - cellH / 2)} h ${f(w)} v ${f(cellH)} h ${f(-w)} Z`);
-          }
-          for (const [color, paths] of cRects) lines.push(`<path fill="${color}" d="${paths.join(" ")}"/>`);
-          if (track.border?.show) {
-            const bw = track.border.width;
-            const rowY = (i: number) => H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
-            const y0 = Math.max(rowY(0) - leafSpacingPx / 2, -bw);
-            const y1 = Math.min(rowY(tree.leaves.length - 1) + leafSpacingPx / 2, H + bw);
-            if (y1 > y0) lines.push(`<rect x="${f(currentX)}" y="${f(y0)}" width="${f(track.height)}" height="${f(y1 - y0)}" fill="none" stroke="${track.border.color}" stroke-width="${f(bw)}"/>`);
-          }
-          currentX += track.height + trackGap(track);
-        }
+        renderRingStack(
+          base => svgBand(lines, { kind: "rect", x0: base }, f),
+          overlayTrackX, 1, slots,
+          rowY(0) - leafSpacingPx / 2, rowY(tree.leaves.length - 1) + leafSpacingPx / 2, false,
+          undefined, { min: -svgMargin, max: W + svgMargin }
+        );
         lines.push('</g>');
       }
 
@@ -3218,7 +3650,7 @@ export default function Phylo() {
           const name = tree.nodes[leafId].name; if (!name) continue;
           const sY = H / 2 + offset.y + vZoom * (-H / 2 + PADDING + sy * i);
           if (sY < 0 || sY > H) continue;
-          lines.push(`<text x="${f(overlayLabelX)}" y="${f(sY)}">${esc(name)}</text>`);
+          lines.push(...svgLabel(leafId, name, overlayLabelX, sY, "start", 0, fz));
         }
         lines.push('</g>');
       }
@@ -3267,70 +3699,51 @@ export default function Phylo() {
         }
         const P = getPolar(nd.id); const Ps = gp(P);
         if (!svgVisible(Ps.x, Ps.y)) continue;
-        const cP = nd.support !== undefined ? supportColor(nd.support) : "#333";
+        const cP = svgBranchColor(nd.id);
         for (const ch of nd.children) {
           if (skipNode[ch] === 2) continue;
           const C = getPolar(ch); const Cs = gp(C);
           if (!svgVisible(Ps.x, Ps.y) && !svgVisible(Cs.x, Cs.y)) continue;
-          const cC = tree.nodes[ch].support !== undefined ? supportColor(tree.nodes[ch].support!) : "#333";
+          const cC = svgBranchColor(ch);
           if (P.radius > 0) {
             let da = C.angle - P.angle;
             if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
             const sw = da >= 0 ? 1 : 0;
             const arcR = P.radius * gZoom;
             const ex = cx + arcR * Math.cos(C.angle), ey = cy + arcR * Math.sin(C.angle);
-            if (!bPaths.has(cP)) bPaths.set(cP, []);
-            bPaths.get(cP)!.push(`M ${f(Ps.x)},${f(Ps.y)} A ${f(arcR)},${f(arcR)} 0 0,${sw} ${f(ex)},${f(ey)}`);
-            if (!bPaths.has(cC)) bPaths.set(cC, []);
-            bPaths.get(cC)!.push(`M ${f(ex)},${f(ey)} L ${f(Cs.x)},${f(Cs.y)}`);
+            const kP = `${cP}|${nodeWidthPx[nd.id]}`, kC = `${cC}|${nodeWidthPx[ch]}`;
+            if (!bPaths.has(kP)) bPaths.set(kP, []);
+            bPaths.get(kP)!.push(`M ${f(Ps.x)},${f(Ps.y)} A ${f(arcR)},${f(arcR)} 0 0,${sw} ${f(ex)},${f(ey)}`);
+            if (!bPaths.has(kC)) bPaths.set(kC, []);
+            bPaths.get(kC)!.push(`M ${f(ex)},${f(ey)} L ${f(Cs.x)},${f(Cs.y)}`);
           } else {
-            if (!bPaths.has(cC)) bPaths.set(cC, []);
-            bPaths.get(cC)!.push(`M ${f(Ps.x)},${f(Ps.y)} L ${f(Cs.x)},${f(Cs.y)}`);
+            const kC = `${cC}|${nodeWidthPx[ch]}`;
+            if (!bPaths.has(kC)) bPaths.set(kC, []);
+            bPaths.get(kC)!.push(`M ${f(Ps.x)},${f(Ps.y)} L ${f(Cs.x)},${f(Cs.y)}`);
           }
         }
       }
       lines.push('<g id="branches">');
-      for (const [color, paths] of bPaths) lines.push(`<path stroke="${color}" stroke-width="${f(lw)}" fill="none" d="${paths.join(" ")}"/>`);
+      for (const [key, paths] of bPaths) { const [color, w] = key.split("|"); lines.push(`<path stroke="${color}" stroke-width="${f(Number(w))}" fill="none" d="${paths.join(" ")}"/>`); }
       lines.push('</g>');
 
-      // Annotation tracks — annular arc segments (matches canvas, supports optBarFill)
-      if (showTracks) {
-        // Same cells, LOD and geometry as the canvas overlay (screen px; heights
-        // scaled by gZoom only when rings zoom with the tree).
-        const trackStartS = trackStartRadius * gZoom;
-        const leafArcPx = trackStartS * anglePerLeaf;
+      // Annotation rings (same drawing code as the canvas; no culling)
+      if (showTracks && effectiveTrackW > 0) {
+        const r0 = trackStartRadius * gZoom;
+        const pxScale = tracksZoomWithTree ? gZoom : 1;
+        const leafArcPx = r0 * anglePerLeaf;
         const leafStep = leafArcPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafArcPx)) : 1;
-        const cells = circularRingCells(N, leafStep, skipNode);
-        const trackPx = tracksZoomWithTree ? gZoom : 1;
+        // Same viewport culling as the canvas (the SVG viewBox is the screen).
+        const win = polarWindow(-svgMargin - cx, -svgMargin - cy, W + svgMargin - cx, H + svgMargin - cy);
+        const rOuter = r0 + effectiveTrackW * pxScale;
+        const slots = rOuter >= win.rMin && r0 <= win.rMax ? circularSlots(N, leafStep, skipNode, win) : [];
+        const uStart = (startAngleDeg * Math.PI) / 180;
         lines.push('<g id="annotations">');
-        let curS = trackStartS;
-        for (const track of trackConfig) {
-          if (!track.visible) continue;
-          const r1s = curS, r2s = curS + track.height * trackPx;
-          curS += (track.height + trackGap(track)) * trackPx;
-          if (track.border?.show) {
-            const startRad = (rotation * Math.PI) / 180;
-            lines.push(`<path fill="none" stroke="${track.border.color}" stroke-width="${f(track.border.width * trackPx)}" d="${svgRingOutline(cx, cy, r1s, r2s, startRad - arcRad, startRad, arcDeg >= 360, f)}"/>`);
-          }
-          const cPaths = new Map<string, string[]>();
-          const paint = trackPainters.get(track.key);
-          for (const { lo, hi, row } of cells) {
-            const cell = paint?.(row);
-            if (!cell) continue;
-            const color = cell.color, rOut = r1s + cell.frac * (r2s - r1s);
-            if (!cPaths.has(color)) cPaths.set(color, []);
-            // Annular cell: outer arc lo→hi (sweep=1, clockwise on screen), inner arc back (sweep=0).
-            // Split at the midpoint so each arc is < π and a full-ring cell (≥ 2π) still draws.
-            const hiC = Math.min(hi, lo + 2 * Math.PI - 1e-6);
-            const mid = (lo + hiC) / 2;
-            const P = (r: number, a: number) => `${f(cx + r * Math.cos(a))},${f(cy + r * Math.sin(a))}`;
-            cPaths.get(color)!.push(
-              `M ${P(rOut, lo)} A ${f(rOut)},${f(rOut)} 0 0,1 ${P(rOut, mid)} A ${f(rOut)},${f(rOut)} 0 0,1 ${P(rOut, hiC)} ` +
-              `L ${P(r1s, hiC)} A ${f(r1s)},${f(r1s)} 0 0,0 ${P(r1s, mid)} A ${f(r1s)},${f(r1s)} 0 0,0 ${P(r1s, lo)} Z`
-            );
-          }
-          for (const [color, paths] of cPaths) lines.push(`<path fill="${color}" d="${paths.join(" ")}"/>`);
-        }
+        renderRingStack(
+          base => svgBand(lines, { kind: "polar", cx, cy, r0: base }, f),
+          r0, pxScale, slots, uStart, uStart - arcRad, arcDeg >= 360,
+          { min: win.rMin, max: win.rMax }, { min: win.rMin, max: win.rMax }
+        );
         lines.push('</g>');
       }
 
@@ -3350,7 +3763,7 @@ export default function Phylo() {
             const cosA = Math.cos(angle);
             const ta = cosA >= 0 ? "start" : "end";
             const rot = cosA >= 0 ? angle * 180 / Math.PI : angle * 180 / Math.PI + 180;
-            lines.push(`<text x="${f(lx)}" y="${f(ly)}" text-anchor="${ta}" transform="rotate(${f(rot)},${f(lx)},${f(ly)})">${esc(name)}</text>`);
+            lines.push(...svgLabel(leafId, name, lx, ly, ta, rot, fz));
           }
           lines.push('</g>');
         }
@@ -3401,58 +3814,36 @@ export default function Phylo() {
           if (!svgVisible(p.x, p.y) && !svgVisible(c.x, c.y)) continue;
           const segLen = Math.hypot(c.x - p.x, c.y - p.y);
           if (segLen <= MIN_SEG_PX) continue;
-          const color = tree.nodes[ch].support !== undefined ? supportColor(tree.nodes[ch].support!) : "#333";
-          if (!bPaths.has(color)) bPaths.set(color, []);
-          bPaths.get(color)!.push(`M ${f(p.x)},${f(p.y)} L ${f(c.x)},${f(c.y)}`);
+          const color = svgBranchColor(ch);
+          const k = `${color}|${nodeWidthPx[ch]}`;
+          if (!bPaths.has(k)) bPaths.set(k, []);
+          bPaths.get(k)!.push(`M ${f(p.x)},${f(p.y)} L ${f(c.x)},${f(c.y)}`);
         }
       }
       lines.push('<g id="branches">');
-      for (const [color, paths] of bPaths) lines.push(`<path stroke="${color}" stroke-width="${f(lw)}" fill="none" d="${paths.join(" ")}"/>`);
+      for (const [key, paths] of bPaths) { const [color, w] = key.split("|"); lines.push(`<path stroke="${color}" stroke-width="${f(Number(w))}" fill="none" d="${paths.join(" ")}"/>`); }
       lines.push('</g>');
 
-      // Annotation ring — arc segments, LOD-thinned, batched by colour
-      if (showTracks) {
-        const sortedLeafIds = tree.leaves
-          .filter(id => skipNode[id] !== 2)
-          .slice()
-          .sort((a, b) => coords[a].angle - coords[b].angle);
-        if (sortedLeafIds.length > 0) {
-          const arcPerLeaf = (2 * Math.PI) / sortedLeafIds.length;
-          const k = trackWorldScale();
-          let curR = ringR;
-          lines.push('<g id="annotations">');
-          for (const track of trackConfig) {
-            if (!track.visible) continue;
-            const r1s = curR * gZoom, r2s = (curR + track.height * k) * gZoom;
-            const arcPx = curR * arcPerLeaf * gZoom;
-            const leafStep = Math.max(1, Math.floor(optLodMinPx / Math.max(arcPx, 1e-9)));
-            const cPaths = new Map<string, string[]>();
-            const paint = trackPainters.get(track.key);
-            for (let i = 0; i < sortedLeafIds.length; i += leafStep) {
-              const idA = sortedLeafIds[i];
-              const idB = sortedLeafIds[(i + leafStep) % sortedLeafIds.length];
-              const cell = paint?.(annotations.get(tree.nodes[idA].name || ""));
-              if (!cell) continue;
-              const color = cell.color, rOs = r1s + cell.frac * (r2s - r1s);
-              const a1 = coords[idA].angle;
-              const a2raw = coords[idB].angle;
-              const a2 = a2raw > a1 ? a2raw : a2raw + 2 * Math.PI;
-              const large = (a2 - a1) > Math.PI ? 1 : 0;
-              const [ox1, oy1] = [cx + rOs * Math.cos(a1), cy + rOs * Math.sin(a1)];
-              const [ox2, oy2] = [cx + rOs * Math.cos(a2), cy + rOs * Math.sin(a2)];
-              const [ix1, iy1] = [cx + r1s * Math.cos(a2), cy + r1s * Math.sin(a2)];
-              const [ix2, iy2] = [cx + r1s * Math.cos(a1), cy + r1s * Math.sin(a1)];
-              if (!cPaths.has(color)) cPaths.set(color, []);
-              cPaths.get(color)!.push(`M ${f(ox1)},${f(oy1)} A ${f(rOs)},${f(rOs)} 0 ${large},1 ${f(ox2)},${f(oy2)} L ${f(ix1)},${f(iy1)} A ${f(r1s)},${f(r1s)} 0 ${large},0 ${f(ix2)},${f(iy2)} Z`);
-            }
-            for (const [color, paths] of cPaths) lines.push(`<path fill="${color}" d="${paths.join(" ")}"/>`);
-            if (track.border?.show) {
-              lines.push(`<path fill="none" stroke="${track.border.color}" stroke-width="${f(track.border.width * k * gZoom)}" d="${svgRingOutline(cx, cy, r1s, r2s, 0, 0, true, f)}"/>`);
-            }
-            curR += (track.height + trackGap(track)) * k;
-          }
-          lines.push('</g>');
-        }
+      // Annotation rings (same drawing code as the canvas; no culling)
+      if (showTracks && effectiveTrackW > 0) {
+        const r0 = ringR * gZoom;
+        const pxScale = trackWorldScale() * gZoom;
+        let n = 0;
+        for (const id of unrootedLeafOrder) if (skipNode[id] !== 2) n++;
+        n = n || 1;
+        const leafArcPx = r0 * ((2 * Math.PI) / n);
+        const leafStep = leafArcPx > 0 ? Math.max(1, Math.floor(optLodMinPx / leafArcPx)) : 1;
+        const win = polarWindow(-svgMargin - cx, -svgMargin - cy, W + svgMargin - cx, H + svgMargin - cy);
+        const rOuter = r0 + effectiveTrackW * pxScale;
+        const slots = rOuter >= win.rMin && r0 <= win.rMax ? unrootedSlots(unrootedLeafOrder, coords, leafStep, skipNode, win) : [];
+        const uStart = unrootedLeafOrder.length ? coords[unrootedLeafOrder[0]].angle : 0;
+        lines.push('<g id="annotations">');
+        renderRingStack(
+          base => svgBand(lines, { kind: "polar", cx, cy, r0: base }, f),
+          r0, pxScale, slots, uStart, uStart + 2 * Math.PI, true,
+          { min: win.rMin, max: win.rMax }, { min: win.rMin, max: win.rMax }
+        );
+        lines.push('</g>');
       }
 
       // Leaf labels
@@ -3475,16 +3866,58 @@ export default function Phylo() {
             const cosA = Math.cos(angle);
             const ta = cosA >= 0 ? "start" : "end";
             const rot = cosA >= 0 ? angle * 180 / Math.PI : angle * 180 / Math.PI + 180;
-            lines.push(`<text x="${f(lx)}" y="${f(ly)}" text-anchor="${ta}" transform="rotate(${f(rot)},${f(lx)},${f(ly)})">${esc(name)}</text>`);
+            lines.push(...svgLabel(leafId, name, lx, ly, ta, rot, fz));
           }
           lines.push('</g>');
         }
       }
     }
 
+    // Node decorations (connections, pies, symbols) at their on-screen positions.
+    {
+      const cx = W / 2 + offset.x, cy = H / 2 + offset.y;
+      const N = tree.leaves.length || 1;
+      const Rc = Math.min(W, H) * CIRC_RADIUS_FRACTION;
+      const Ru = unrootedLayout ? Rc / (unrootedLayout.maxR || 1) : 0;
+      let nodeScreen: (id: number) => [number, number] | null = () => null;
+      let from = 0, to = tree.leaves.length;
+      if (layout === "rect" && rectLayout) {
+        const { coords, height: rh, maxX } = rectLayout;
+        const sxv = computeRectSx(W, maxX, effectiveTrackW);
+        const syv = (H - 2 * PADDING) / Math.max(1, rh);
+        nodeScreen = (id) => skipNode[id] === 2 ? null : [cx + (-W / 2 + PADDING + sxv * (coords as any)[id].x), cy + vZoom * (-H / 2 + PADDING + syv * (coords as any)[id].y)];
+        const topWy = (0 - H / 2 - offset.y) / vZoom, bottomWy = (H - H / 2 - offset.y) / vZoom;
+        from = clamp(Math.floor((topWy + H / 2 - PADDING) / syv) - 1, 0, N);
+        to = clamp(Math.ceil((bottomWy + H / 2 - PADDING) / syv) + 1, 0, N);
+      } else if (layout === "circular" && rectLayout) {
+        const { coords, maxX } = rectLayout;
+        nodeScreen = (id) => {
+          if (skipNode[id] === 2) return null;
+          const a = (coords as any)[id];
+          const P = rectToPolar(maxX > 0 ? a.x / maxX : 0, a.y, N, Rc, rotation, arc);
+          return [cx + gZoom * P.x, cy + gZoom * P.y];
+        };
+      } else if (unrootedLayout) {
+        const uc = unrootedLayout.coords;
+        nodeScreen = (id) => skipNode[id] === 2 ? null : [cx + gZoom * uc[id].x * Ru, cy + gZoom * uc[id].y * Ru];
+      }
+      const out = svgBand(lines, { kind: "rect", x0: 0 }, f);
+      lines.push('<g id="decorations">');
+      const leafPx = layout === "rect" && rectLayout ? vZoom * (H - 2 * PADDING) / Math.max(1, rectLayout.height)
+        : layout === "circular" ? Rc * gZoom * ((arc * Math.PI) / 180) / N
+        : Rc * gZoom * (2 * Math.PI) / N;
+      renderDecorations(out, (p, q, cp, color, width, dashed, alpha, cp2) => {
+        const d = cp && cp2 ? `M ${f(p[0])},${f(p[1])} C ${f(cp[0])},${f(cp[1])} ${f(cp2[0])},${f(cp2[1])} ${f(q[0])},${f(q[1])}`
+          : cp ? `M ${f(p[0])},${f(p[1])} Q ${f(cp[0])},${f(cp[1])} ${f(q[0])},${f(q[1])}`
+          : `M ${f(p[0])},${f(p[1])} L ${f(q[0])},${f(q[1])}`;
+        lines.push(`<path fill="none" stroke="${color}" stroke-width="${f(width)}" stroke-opacity="${alpha}"${dashed ? ' stroke-dasharray="8,6"' : ""} d="${d}"/>`);
+      }, nodeScreen, W, H, [cx, cy], layout === "rect" ? "rect" : "radial", from, to, leafPx);
+      out.flush();
+      lines.push('</g>');
+    }
+
     // Legend at its on-screen position (same layout as the canvas).
     const lb = legendBoxRef.current;
-    const measureCtx = canvasRef.current?.getContext("2d");
     const legendLayout = lb && measureCtx ? computeLegendLayout(measureCtx) : null;
     if (lb && legendLayout) lines.push(...legendToSvg(legendLayout, lb.x, lb.y));
 
@@ -3527,6 +3960,9 @@ export default function Phylo() {
   const loadExample = async () => {
     deletedStyleStash.current.clear();
     setDeletedColumns(new Set());
+    setConnectionFiles([]);
+    setDecor(DEFAULT_DECOR);
+    setTrackConfig(prev => prev.filter(isColumnRing)); // multi-column rings referred to the previous data
     setCollapsedNodes(new Set());
     setRanges([]);
     setSelectedNode(null);
@@ -3562,6 +3998,8 @@ export default function Phylo() {
       vZoom, gZoom, offset,
       showLeafLabels, showTracks, trackOffset, trackOffsetMode, tracksZoomWithTree,
       annotationFiles: annotationFiles.map(stripDeleted),
+      connectionFiles,
+      decor,
       trackConfig,
       colorMaps: Object.fromEntries(
         [...colorMaps.entries()].map(([k, v]) => [k, Object.fromEntries(v)])
@@ -3639,6 +4077,8 @@ export default function Phylo() {
           deletedStyleStash.current.clear();
         }
         if (s.trackConfig) setTrackConfig(s.trackConfig);
+        setConnectionFiles(Array.isArray(s.connectionFiles) ? s.connectionFiles : []);
+        setDecor({ ...DEFAULT_DECOR, ...(s.decor ?? {}) });
         if (s.colorMaps) {
           const cm = new Map<string, Map<string, string>>();
           for (const [k, v] of Object.entries(s.colorMaps)) {
@@ -3715,7 +4155,7 @@ export default function Phylo() {
   // are the rings' display names (made unique).
   const handleExportAnnotations = () => {
     if (!tree) return;
-    const tracks = trackConfig.filter(t => !annExportVisibleOnly || t.visible);
+    const tracks = columnRings.filter(t => !annExportVisibleOnly || t.visible);
     const used = new Set<string>(["id"]);
     const headers = tracks.map(t => {
       const base = (t.label || t.key).trim() || t.key;
@@ -4042,7 +4482,7 @@ export default function Phylo() {
 
   const hoverCladeStats = useMemo(() => {
     if (hoverNode === null || !tree) return null;
-    const catTracks = trackConfig.filter((t) => t.type === "categorical" && t.visible);
+    const catTracks = columnRings.filter((t) => t.type === "categorical" && t.visible);
     if (catTracks.length === 0) return null;
     const nd = tree.nodes[hoverNode];
     const counts = new Map<string, Map<string, number>>();
@@ -4067,7 +4507,7 @@ export default function Phylo() {
       const labelledCount = [...m.values()].reduce((s, v) => s + v, 0);
       return { key: t.key, label: t.label || t.key, topValues: sorted, totalLeaves: nd.R - nd.L, labelledCount };
     }).filter((g) => g.topValues.length > 0);
-  }, [hoverNode, tree, annotations, trackConfig]);
+  }, [hoverNode, tree, annotations, columnRings]);
 
   // ==========================================================
   // Search
@@ -4231,7 +4671,7 @@ export default function Phylo() {
             {annotationFiles.length > 0 && (
               <div style={{ marginTop: 4 }}>
                 {annotationFiles.map((f, idx) => (
-                  <span key={idx} className="chip" title={`${f.rows.length} rows · ${f.columns.length} columns`}>
+                  <span key={idx} className="chip" title={`${f.note ? f.note + "\n" : ""}${f.rows.length} rows · ${f.columns.length} columns`}>
                     <span style={{ maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {f.name}
                     </span>
@@ -4240,6 +4680,16 @@ export default function Phylo() {
                       onClick={() => removeAnnotationFile(idx)}
                       title="Close this annotation file"
                     >×</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            {connectionFiles.length > 0 && (
+              <div style={{ marginTop: 4 }}>
+                {connectionFiles.map((f, idx) => (
+                  <span key={idx} className="chip" title={`Connections: ${f.connections.length} (see Tree decorations)`}>
+                    <span style={{ maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>⇄ {f.name}</span>
+                    <button className="btn" onClick={() => setConnectionFiles(prev => prev.filter((_, i) => i !== idx))} title="Close this connections file">×</button>
                   </span>
                 ))}
               </div>
@@ -4391,7 +4841,7 @@ export default function Phylo() {
         </div>
 
         {/* ── SECTION: Find by annotation ── */}
-        {trackConfig.length > 0 && (<>
+        {columnRings.length > 0 && (<>
           <div className="section-header" onClick={() => toggleSection("annSearch")}>
             <span>Find by annotation{annMatches ? ` (${annMatches.ids.length.toLocaleString()})` : ""}</span>
             <span>{sectionOpen.annSearch ? "▲" : "▼"}</span>
@@ -4399,7 +4849,7 @@ export default function Phylo() {
           {sectionOpen.annSearch && (
             <div className="row ann-search">
               <select value={annSearchKey ?? ""} onChange={(e) => chooseAnnSearchKey(e.target.value || null)} style={{ width: "100%", marginBottom: 6 }}>
-                {trackConfig.map(t => <option key={t.key} value={t.key}>{t.label || t.key}</option>)}
+                {columnRings.map(t => <option key={t.key} value={t.key}>{t.label || t.key}</option>)}
               </select>
 
               {annSearchTrack?.type === "categorical" && (<>
@@ -4739,7 +5189,7 @@ export default function Phylo() {
                     : "Rings keep a fixed on-screen width. Auto: start at outermost visible branch + offset."}
                 </div>
               </div>
-              {trackConfig.some(t => t.type === "categorical") && (
+              {columnRings.some(t => t.type === "categorical") && (
                 <div style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
                   <span className="note">Default range colour source:</span>
                   <select
@@ -4749,7 +5199,7 @@ export default function Phylo() {
                     style={{ fontSize: 12 }}
                   >
                     <option value="">Manual</option>
-                    {trackConfig.filter(t => t.type === "categorical").map(t => (
+                    {columnRings.filter(t => t.type === "categorical").map(t => (
                       <option key={t.key} value={t.key}>{t.label || t.key}</option>
                     ))}
                   </select>
@@ -4824,12 +5274,22 @@ export default function Phylo() {
                         onBlur={(e) => (e.currentTarget.style.borderColor = "transparent")}
                       />
                       <div className="track-item-controls">
-                        <select value={track.type} onChange={(e) => updateTrack(i, "type", e.target.value)}>
-                          <option value="categorical">Categorical</option>
-                          <option value="continuous">Continuous</option>
-                        </select>
-                        <input type="number" value={track.height} onChange={(e) => updateTrack(i, "height", e.target.value)} style={{ width: 46 }} min="1" max="100" />
-                        <span className="note">px</span>
+                        {isColumnRing(track) ? (
+                          <select value={track.type} onChange={(e) => updateTrack(i, "type", e.target.value)}>
+                            <option value="categorical">Categorical</option>
+                            <option value="continuous">Continuous</option>
+                          </select>
+                        ) : (
+                          <span className="ring-kind-chip" title={(track.fields ?? []).map(columnLabel).join(", ")}>
+                            {ringModule(track).title} · {(track.fields ?? []).length} col
+                          </span>
+                        )}
+                        {ringModule(track).width ? (
+                          <span className="note" title="Width comes from this ring's options">{Math.round(ringWidth(track, ringInfo))} px</span>
+                        ) : (<>
+                          <input type="number" value={track.height} onChange={(e) => updateTrack(i, "height", e.target.value)} style={{ width: 46 }} min="1" max="400" />
+                          <span className="note">px</span>
+                        </>)}
                         <button className="btn" style={{ padding: "2px 5px", fontSize: 11 }} onClick={() => setShowLegendKey(track.key === showLegendKey ? null : track.key)}>
                           Style {showLegendKey === track.key ? "▴" : "▾"}
                         </button>
@@ -4850,27 +5310,42 @@ export default function Phylo() {
                           onPatch={(patch) => patchTrack(track.key, patch)}
                           onEditCategory={(category) => setEditingColor({ trackKey: track.key, category })}
                           editColor={(title, color, apply) => setColorEdit({ title, color, apply })}
+                          ringModule={isColumnRing(track) ? undefined : ringModule(track)}
+                          columns={columnChoices}
+                          categories={(optKey) => ringModule(track).categories?.(track, optKey, ringInfo) ?? []}
+                          categoryColor={(optKey, cat) => ringModule(track).categoryColor?.(track, optKey, cat, ringInfo)}
                         />
                         <div className="style-actions">
                           <button type="button" className="btn" onClick={() => setStyleClip(copyStyle(track, colorMaps.get(track.key)))}
                             title="Copy this ring's colours and style">Copy style</button>
                           <button type="button" className="btn"
-                            disabled={!styleClip || styleClip.type !== track.type}
+                            disabled={!clipFits(track)}
                             title={!styleClip ? "Copy a ring's style first"
-                              : styleClip.type !== track.type ? `Copied style is ${styleClip.type}; this ring is ${track.type}`
+                              : !clipFits(track) ? `Copied style is from a different kind of ring`
                               : `Paste the style copied from “${styleClip.fromLabel}”`}
                             onClick={() => pasteStyleTo(track)}
-                          >Paste style{styleClip && styleClip.type === track.type ? ` (${styleClip.fromLabel})` : ""}</button>
-                          <button type="button" className="btn btn-danger" style={{ marginLeft: "auto" }}
-                            title="Remove this annotation column (restore it from the list below)"
-                            onClick={() => { deleteColumn(track.key); setShowLegendKey(null); }}
-                          >Delete column</button>
+                          >Paste style{styleClip && clipFits(track) ? ` (${styleClip.fromLabel})` : ""}</button>
+                          {isColumnRing(track) ? (
+                            <button type="button" className="btn btn-danger" style={{ marginLeft: "auto" }}
+                              title="Remove this annotation column (restore it from the list below)"
+                              onClick={() => { deleteColumn(track.key); setShowLegendKey(null); }}
+                            >Delete column</button>
+                          ) : (
+                            <button type="button" className="btn btn-danger" style={{ marginLeft: "auto" }}
+                              title="Remove this ring (its columns stay loaded)"
+                              onClick={() => { removeRing(track.key); setShowLegendKey(null); }}
+                            >Remove ring</button>
+                          )}
                         </div>
                       </div>
                     )}
                   </div>
                 ))}
               </div>
+              <AddRingForm
+                columns={columnChoices}
+                onAdd={(kind, fields, label) => addRing(kind, fields, label)}
+              />
               {deletedColumns.size > 0 && (
                 <div className="note" style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
                   Deleted: {[...deletedColumns].join(", ")}
@@ -4978,6 +5453,150 @@ export default function Phylo() {
                 {Object.keys(legendLabels).length > 0 && (
                   <button type="button" className="btn" onClick={() => setLegendLabels({})}>Reset renamed text</button>
                 )}
+              </div>
+            </div>
+          )}
+        </>)}
+
+        {/* ── SECTION: Tree decorations (from annotation columns) ── */}
+        {tree && (columnRings.length > 0 || connectionFiles.length > 0) && (<>
+          <div className="section-header" onClick={() => toggleSection("decor")}>
+            <span>Tree decorations</span><span>{sectionOpen.decor ? "▲" : "▼"}</span>
+          </div>
+          {sectionOpen.decor && (
+            <div className="row decor-panel">
+              <div className="note" style={{ marginBottom: 6 }}>
+                Style the tree from annotation columns. Rows whose id is “leafA|leafB” apply to that clade.
+              </div>
+              {([
+                ["Branch colour", "branchColorBy"],
+                ["Label colour", "labelColorBy"],
+                ["Label background", "labelBgBy"],
+                ["Rename labels from", "labelRenameBy"],
+                ["Label style (bold/italic)", "labelStyleBy"],
+              ] as const).map(([lbl, key]) => (
+                <div key={key} className="style-row">
+                  <span className="note decor-label">{lbl}</span>
+                  <select value={decor[key] ?? ""} onChange={(e) => patchDecor({ [key]: e.target.value || null } as Partial<TreeDecor>)} style={{ fontSize: 11, flex: 1, minWidth: 0 }}>
+                    <option value="">— none —</option>
+                    {columnChoices.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+                  </select>
+                </div>
+              ))}
+              {decor.branchColorBy && (
+                <label className="note style-row" style={{ gap: 6 }}>
+                  <input type="checkbox" checked={decor.branchColorMode === "clades"} onChange={(e) => patchDecor({ branchColorMode: e.target.checked ? "clades" : "leaves" })} />
+                  Colour a clade's branches when all its leaves agree
+                </label>
+              )}
+              {decor.labelBgBy && (
+                <div className="style-row">
+                  <span className="note decor-label">Background opacity</span>
+                  <input type="range" min={0.1} max={1} step={0.05} value={decor.labelBgAlpha} onChange={(e) => patchDecor({ labelBgAlpha: Number(e.target.value) })} style={{ flex: 1 }} />
+                </div>
+              )}
+              <div className="style-row">
+                <span className="note decor-label">Branch width by</span>
+                <select value={decor.branchWidthBy ?? ""} onChange={(e) => patchDecor({ branchWidthBy: e.target.value || null })} style={{ fontSize: 11, flex: 1, minWidth: 0 }}>
+                  <option value="">— none —</option>
+                  {columnChoices.filter(c => c.numeric).map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+                </select>
+              </div>
+
+              <div className="note decor-heading">Node symbols</div>
+              <div className="style-row">
+                <span className="note decor-label">Symbol by</span>
+                <select value={decor.symbolBy ?? ""} onChange={(e) => patchDecor({ symbolBy: e.target.value || null })} style={{ fontSize: 11, flex: 1, minWidth: 0 }}>
+                  <option value="">— none —</option>
+                  {columnChoices.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+                </select>
+              </div>
+              {decor.symbolBy && (
+                <div className="style-row">
+                  <select value={decor.symbolShape} onChange={(e) => patchDecor({ symbolShape: e.target.value as TreeDecor["symbolShape"] })} style={{ fontSize: 11 }}>
+                    {SHAPE_CHOICES.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
+                  </select>
+                  <span className="note">size</span>
+                  <input type="range" min={3} max={24} step={1} value={decor.symbolSize} onChange={(e) => patchDecor({ symbolSize: Number(e.target.value) })} style={{ width: 60 }} />
+                  <label className="note" style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                    <input type="checkbox" checked={decor.symbolFilled} onChange={(e) => patchDecor({ symbolFilled: e.target.checked })} /> filled
+                  </label>
+                </div>
+              )}
+
+              <div className="note decor-heading">Node pie charts</div>
+              <div className="ann-value-list" style={{ maxHeight: 100 }}>
+                {columnChoices.filter(c => c.numeric).map(c => (
+                  <label key={c.key} className="ann-value-item">
+                    <input type="checkbox" checked={decor.pieFields.includes(c.key)}
+                      onChange={(e) => patchDecor({ pieFields: e.target.checked ? [...decor.pieFields, c.key] : decor.pieFields.filter(k => k !== c.key) })} />
+                    <span className="ann-value-swatch" style={{ background: decor.pieFields.includes(c.key) ? FIELD_PALETTE[decor.pieFields.indexOf(c.key) % FIELD_PALETTE.length] : "transparent" }} />
+                    <span className="ann-value-name">{c.label}</span>
+                  </label>
+                ))}
+              </div>
+              {decor.pieFields.length > 0 && (
+                <div className="style-row">
+                  <span className="note">radius</span>
+                  <input type="range" min={3} max={40} step={1} value={decor.pieRadius} onChange={(e) => patchDecor({ pieRadius: Number(e.target.value) })} style={{ width: 70 }} />
+                  <label className="note" style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                    <input type="checkbox" checked={decor.pieScaled} onChange={(e) => patchDecor({ pieScaled: e.target.checked })} /> size by total
+                  </label>
+                </div>
+              )}
+
+              {connectionFiles.length > 0 && (<>
+                <div className="note decor-heading">Connections ({resolvedConnections.length} of {connectionFiles.reduce((n, f) => n + f.connections.length, 0)} matched)</div>
+                <label className="note style-row" style={{ gap: 6 }}>
+                  <input type="checkbox" checked={decor.connShow} onChange={(e) => patchDecor({ connShow: e.target.checked })} /> Show connections
+                </label>
+                <div className="style-row">
+                  <span className="note decor-label">Curve</span>
+                  <select value={decor.connCurve} onChange={(e) => patchDecor({ connCurve: e.target.value as TreeDecor["connCurve"] })} style={{ fontSize: 11 }}>
+                    <option value="root">Bow towards the root</option>
+                    <option value="center">Through the centre (radial)</option>
+                    <option value="straight">Straight</option>
+                  </select>
+                </div>
+                <div className="style-row">
+                  <Swatch color={decor.connColor} title="Default colour (rows can set their own)" onClick={() => setColorEdit({ title: "Connection colour", color: decor.connColor, apply: (c) => patchDecor({ connColor: c }) })} />
+                  <span className="note">width</span>
+                  <input type="range" min={0.5} max={8} step={0.5} value={decor.connWidth} onChange={(e) => patchDecor({ connWidth: Number(e.target.value) })} style={{ width: 55 }} />
+                  <span className="note">opacity</span>
+                  <input type="range" min={0.1} max={1} step={0.05} value={decor.connOpacity} onChange={(e) => patchDecor({ connOpacity: Number(e.target.value) })} style={{ width: 55 }} />
+                </div>
+                <label className="note style-row" style={{ gap: 6 }}>
+                  <input type="checkbox" checked={decor.connArrows} onChange={(e) => patchDecor({ connArrows: e.target.checked })} /> Arrowheads at the target
+                </label>
+              </>)}
+              <div className="note decor-heading">Clades from a column</div>
+              <div className="note" style={{ marginBottom: 4 }}>Find the largest clades whose leaves all share one value.</div>
+              <div className="style-row">
+                <select value={cladeCol ?? ""} onChange={(e) => setCladeCol(e.target.value || null)} style={{ fontSize: 11, flex: 1, minWidth: 0 }}>
+                  <option value="">Column…</option>
+                  {columnRings.filter(t => t.type === "categorical").map(t => <option key={t.key} value={t.key}>{t.label}</option>)}
+                </select>
+                <span className="note">min</span>
+                <IntField value={cladeMin} min={2} max={100000} onChange={setCladeMin} style={{ width: 52, fontSize: 11 }} />
+              </div>
+              {cladeCol && (() => {
+                const clades = uniformCladeList;
+                return (
+                  <div className="style-row" style={{ flexWrap: "wrap" }}>
+                    <span className="note">{clades.length} clades</span>
+                    <button type="button" className="btn" disabled={!clades.length} title="Add a coloured range (category colour + label) for each clade"
+                      onClick={() => {
+                        const cmap = colorMaps.get(cladeCol);
+                        setRanges(prev => [...prev, ...clades.map(c => ({ nodeId: c.nodeId, color: cmap?.get(c.value) ?? "#ffe08a", label: c.value }))]);
+                      }}>Add ranges</button>
+                    <button type="button" className="btn" disabled={!clades.length} title="Collapse each clade into a triangle"
+                      onClick={() => setCollapsedNodes(prev => { const n = new Set(prev); for (const c of clades) n.add(c.nodeId); return n; })}>Collapse</button>
+                  </div>
+                );
+              })()}
+
+              <div style={{ marginTop: 6 }}>
+                <button type="button" className="btn" onClick={() => setDecor(DEFAULT_DECOR)}>Reset decorations</button>
               </div>
             </div>
           )}

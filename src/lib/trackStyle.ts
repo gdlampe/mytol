@@ -232,6 +232,11 @@ export function scaleTicks(sc: ValueScale): Array<{ t: number; label: string }> 
 
 export type StyleClip = {
   fromLabel: string;
+  /** Ring kind ("column" for one-column rings); paste only onto the same kind. */
+  kind: string;
+  /** Multi-column rings: their options and columns (to remap per-field settings). */
+  opts: Record<string, any> | null;
+  fields?: string[];
   type: "categorical" | "continuous";
   colors: Array<[string, string]>;
   shade: ShadeStyle | null;
@@ -243,6 +248,9 @@ export type StyleClip = {
 export function copyStyle(track: TrackConfig, colorMap: Map<string, string> | undefined): StyleClip {
   return {
     fromLabel: track.label,
+    kind: track.kind ?? "column",
+    opts: track.opts ? JSON.parse(JSON.stringify(track.opts)) : null,
+    fields: track.fields ? [...track.fields] : undefined,
     type: track.type,
     colors: colorMap ? [...colorMap] : [],
     shade: track.shade ? { ...track.shade, low: { ...track.shade.low } } : null,

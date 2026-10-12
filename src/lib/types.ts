@@ -9,6 +9,8 @@ export type Node = {
   children: number[];
   length: number;
   support?: number;
+  /** Internal nodes: a non-numeric label from the tree file (clade name). */
+  label?: string;
   isLeaf: boolean;
   depth: number;
   cumLen: number;
@@ -83,6 +85,15 @@ export type TrackConfig = {
   gap?: number;
   /** Outline drawn around this ring. */
   border?: RingBorder;
+  /**
+   * Ring type (see src/lib/rings). Undefined / "column" = the one-column ring
+   * whose key is the column name; other kinds have a generated key ("ring:…").
+   */
+  kind?: import("./rings/types").RingKind;
+  /** Annotation columns read by multi-column ring kinds. */
+  fields?: string[];
+  /** Type-specific options for multi-column ring kinds. */
+  opts?: Record<string, any>;
 };
 
 // ============================================================

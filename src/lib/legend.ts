@@ -1,4 +1,6 @@
 import { hexToRgb } from "./colorUtils";
+import { shapePoints } from "./rings/band";
+import type { ShapeKind } from "./rings/band";
 
 // ============================================================
 // On-canvas legend
@@ -21,6 +23,10 @@ export type LegendEntry = {
   fillAlpha: number;
   /** Draw the swatch as a small gradient (shaded categories: low → category colour). */
   stops?: GradientStop[];
+  /** Draw the swatch as this shape instead of a square. */
+  shape?: ShapeKind;
+  /** Shape outline only (e.g. "absent" in binary rings). */
+  hollow?: boolean;
   edit?: LegendEditTarget;
 };
 
@@ -30,7 +36,7 @@ export type GradientStop = { color: string; opacity: number };
 export type LegendSection =
   | { id: string; title: string; note?: string; kind: "swatches"; entries: LegendEntry[]; more: number }
   | { id: string; title: string; note?: string; kind: "ramp"; min: string; max: string; style: "bar" | "gradient"; color: string; stops?: GradientStop[]; ticks?: Array<{ t: number; label: string }> }
-  | { id: string; title: string; note?: string; kind: "gradient"; stops: GradientStop[]; labels: [string, string, string]; edits: LegendEditTarget[] };
+  | { id: string; title: string; note?: string; kind: "gradient"; stops: GradientStop[]; labels: [string, string, string]; edits?: LegendEditTarget[] };
 
 export type LegendModel = { title: string; sections: LegendSection[] };
 
@@ -38,7 +44,8 @@ export type LegendPrim =
   | { t: "rect"; x: number; y: number; w: number; h: number; fill: string; fillOpacity?: number; stroke?: string; strokeOpacity?: number }
   | { t: "text"; x: number; y: number; text: string; size: number; fill: string; bold?: boolean; italic?: boolean; anchor?: "start" | "middle" | "end" }
   | { t: "wedge"; x: number; y: number; w: number; h: number; fill: string }
-  | { t: "lgrad"; x: number; y: number; w: number; h: number; stops: GradientStop[] };
+  | { t: "lgrad"; x: number; y: number; w: number; h: number; stops: GradientStop[] }
+  | { t: "shape"; kind: ShapeKind; x: number; y: number; size: number; fill: string; hollow?: boolean };
 
 export type LegendHit = {
   kind: "title" | "section" | "entry" | "swatch";
@@ -122,6 +129,8 @@ export function layoutLegend(model: LegendModel, style: LegendStyle, measure: Me
             const e = s.entries[i];
             if (e.stops) {
               prims.push({ t: "lgrad", x, y: ey + (rowH - sw) / 2, w: swW, h: sw, stops: e.stops });
+            } else if (e.shape) {
+              prims.push({ t: "shape", kind: e.shape, x: x + sw / 2, y: ey + rowH / 2, size: sw, fill: e.color, hollow: e.hollow });
             } else {
               prims.push({
                 t: "rect", x, y: ey + (rowH - sw) / 2, w: sw, h: sw,
@@ -190,7 +199,7 @@ export function layoutLegend(model: LegendModel, style: LegendStyle, measure: Me
       const barW = fs * 8;
       prims.push({ t: "lgrad", x: pad, y: y + (rowH - barH) / 2, w: barW, h: barH, stops: s.stops });
       const third = barW / 3;
-      s.edits.forEach((edit, i) => hits.push({ kind: "swatch", id: `${s.id}:${i}`, x: pad + i * third, y, w: third, h: rowH, edit }));
+      (s.edits ?? []).forEach((edit, i) => hits.push({ kind: "swatch", id: `${s.id}:${i}`, x: pad + i * third, y, w: third, h: rowH, edit }));
       y += rowH;
       const lfs = Math.round(fs * 0.9);
       const anchors = ["start", "middle", "end"] as const;
@@ -234,6 +243,14 @@ export function drawLegend(ctx: CanvasRenderingContext2D, L: LegendLayout, ox: n
       ctx.fillStyle = p.fill;
       ctx.textAlign = p.anchor === "middle" ? "center" : p.anchor === "end" ? "right" : "left";
       ctx.fillText(p.text, p.x, p.y);
+    } else if (p.t === "shape") {
+      const pts = shapePoints(p.kind);
+      ctx.beginPath();
+      if (pts === "circle") ctx.arc(p.x, p.y, p.size / 2, 0, 2 * Math.PI);
+      else pts.forEach(([a, b], i) => (i ? ctx.lineTo(p.x + a * p.size, p.y + b * p.size) : ctx.moveTo(p.x + a * p.size, p.y + b * p.size)));
+      ctx.closePath();
+      if (p.hollow) { ctx.strokeStyle = p.fill; ctx.lineWidth = 1.5; ctx.stroke(); }
+      else { ctx.fillStyle = p.fill; ctx.fill(); ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 0.5; ctx.stroke(); }
     } else if (p.t === "wedge") {
       ctx.beginPath();
       ctx.moveTo(p.x, p.y + p.h);
@@ -276,6 +293,14 @@ export function legendToSvg(L: LegendLayout, ox: number, oy: number): string[] {
         p.anchor && p.anchor !== "start" ? `text-anchor="${p.anchor}"` : "",
       ].filter(Boolean).join(" ");
       out.push(`<text ${attrs}>${esc(p.text)}</text>`);
+    } else if (p.t === "shape") {
+      const pts = shapePoints(p.kind);
+      const d = pts === "circle"
+        ? `M ${f(p.x - p.size / 2)},${f(p.y)} A ${f(p.size / 2)},${f(p.size / 2)} 0 1,0 ${f(p.x + p.size / 2)},${f(p.y)} A ${f(p.size / 2)},${f(p.size / 2)} 0 1,0 ${f(p.x - p.size / 2)},${f(p.y)} Z`
+        : `M ${pts.map(([a, b]) => `${f(p.x + a * p.size)},${f(p.y + b * p.size)}`).join(" L ")} Z`;
+      out.push(p.hollow
+        ? `<path fill="none" stroke="${p.fill}" stroke-width="1.5" d="${d}"/>`
+        : `<path fill="${p.fill}" stroke="#000" stroke-opacity="0.35" stroke-width="0.5" d="${d}"/>`);
     } else if (p.t === "wedge") {
       out.push(`<path fill="${p.fill}" d="M ${f(p.x)},${f(p.y + p.h)} L ${f(p.x + p.w)},${f(p.y)} L ${f(p.x + p.w)},${f(p.y + p.h)} Z"/>`);
     } else {
