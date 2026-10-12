@@ -71,6 +71,21 @@ body {
 }
 .section-header:hover { background: #ddd; }
 
+/* Drag handle on the panel's right edge (overlaps the border, takes no width) */
+.panel-resizer {
+  width: 7px;
+  margin: 0 -4px 0 -3px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  position: relative;
+  z-index: 20;
+  touch-action: none;
+}
+.panel-resizer:hover,
+.panel-resizer.dragging,
+.panel-resizer:focus-visible { background: rgba(79, 121, 167, 0.45); outline: none; }
+body.resizing-panel { cursor: col-resize; user-select: none; }
+
 .panel-show-btn {
   position: fixed;
   top: 8px;
@@ -564,7 +579,7 @@ select {
   padding: 6px;
 }
 .style-panel { display: flex; flex-direction: column; gap: 6px; }
-.style-row { display: flex; align-items: center; gap: 6px; }
+.style-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; row-gap: 4px; }
 .style-row > .note:first-child { min-width: 58px; }
 .gradient-preview {
   height: 12px;

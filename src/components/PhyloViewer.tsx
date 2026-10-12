@@ -125,6 +125,15 @@ function svgRingOutline(cx: number, cy: number, r1: number, r2: number, a0: numb
 }
 
 /** Longest category list drawn per legend section (the rest collapse to "… N more"). */
+// Side panel width limits (px) and where the chosen width is remembered.
+const PANEL_DEFAULT_W = 260;
+const PANEL_MIN_W = 200;
+const PANEL_MAX_W = 720;
+const PANEL_WIDTH_KEY = "mytol.panelWidth";
+/** Panel width clamped to the limits, leaving at least 240 px for the canvas. */
+const clampPanelWidth = (w: number) =>
+  Math.round(Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, window.innerWidth - 240, w)));
+
 const LEGEND_MAX_ENTRIES = 100;
 /** Longest item list shown per section in the Legend panel. */
 const LEGEND_PANEL_MAX_ITEMS = 300;
@@ -389,6 +398,18 @@ export default function Phylo() {
   const [rangeDisplayMode, setRangeDisplayMode] = useState<"background" | "branches">("background");
 
   const [panelVisible, setPanelVisible] = useState(true);
+  // Side panel width (drag its right edge); remembered per browser.
+  const [panelWidth, setPanelWidth] = useState<number>(() => {
+    try {
+      const v = Number(localStorage.getItem(PANEL_WIDTH_KEY));
+      if (Number.isFinite(v) && v >= PANEL_MIN_W && v <= PANEL_MAX_W) return v;
+    } catch { /* storage unavailable */ }
+    return PANEL_DEFAULT_W;
+  });
+  useEffect(() => {
+    try { localStorage.setItem(PANEL_WIDTH_KEY, String(panelWidth)); } catch { /* storage unavailable */ }
+  }, [panelWidth]);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const [sectionOpen, setSectionOpen] = useState({
     files: true, export: false, ranges: false, layout: true, tree: true, tracks: false, support: false, options: false,
     annSearch: true, legend: false,
@@ -400,6 +421,23 @@ export default function Phylo() {
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // Redraw when the canvas area changes size (window resize, panel resized or hidden).
+  const [viewSize, setViewSize] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const w = el.clientWidth, h = el.clientHeight;
+        setViewSize((s) => (s.w === w && s.h === h ? s : { w, h }));
+      });
+    });
+    ro.observe(el);
+    return () => { ro.disconnect(); cancelAnimationFrame(raf); };
+  }, []);
 
   const dragging = useRef(false);
   const last = useRef({ x: 0, y: 0 });
@@ -2245,6 +2283,7 @@ export default function Phylo() {
     tracksZoomWithTree, trackPainters,
     annMatches, annHighlight, annHighlightColor, annStepTargets, annDotSize,
     legendModel, legendPos, legendFontSize, legendColumns, legendBox,
+    viewSize,
   ]);
 
   // ==========================================================
@@ -4178,7 +4217,7 @@ export default function Phylo() {
       )}
 
       {/* Left control panel */}
-      <div className="panel" style={{ display: panelVisible ? undefined : "none" }}>
+      <div className="panel" ref={panelRef} style={{ display: panelVisible ? undefined : "none", width: panelWidth }}>
 
         {/* Panel header */}
         <div className="panel-header">
@@ -5056,6 +5095,55 @@ export default function Phylo() {
           </div>
         </div>
       </div>
+
+      {/* Drag handle to resize the panel (double-click resets) */}
+      {panelVisible && (
+        <div
+          className="panel-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize panel"
+          aria-valuenow={panelWidth}
+          aria-valuemin={PANEL_MIN_W}
+          aria-valuemax={PANEL_MAX_W}
+          tabIndex={0}
+          title="Drag to resize the panel (double-click to reset)"
+          onPointerDown={(e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            const handle = e.currentTarget;
+            const panel = panelRef.current;
+            const x0 = e.clientX;
+            const w0 = panel?.getBoundingClientRect().width ?? panelWidth;
+            let w = w0;
+            handle.setPointerCapture(e.pointerId);
+            handle.classList.add("dragging");
+            document.body.classList.add("resizing-panel");
+            // Resize the panel directly while dragging; commit to state on release.
+            const move = (ev: PointerEvent) => {
+              w = clampPanelWidth(w0 + ev.clientX - x0);
+              if (panel) panel.style.width = `${w}px`;
+            };
+            const up = () => {
+              handle.classList.remove("dragging");
+              document.body.classList.remove("resizing-panel");
+              handle.removeEventListener("pointermove", move);
+              handle.removeEventListener("pointerup", up);
+              handle.removeEventListener("pointercancel", up);
+              setPanelWidth(w);
+            };
+            handle.addEventListener("pointermove", move);
+            handle.addEventListener("pointerup", up);
+            handle.addEventListener("pointercancel", up);
+          }}
+          onDoubleClick={() => setPanelWidth(PANEL_DEFAULT_W)}
+          onKeyDown={(e) => {
+            const step = e.shiftKey ? 50 : 10;
+            if (e.key === "ArrowLeft") { e.preventDefault(); setPanelWidth((w) => clampPanelWidth(w - step)); }
+            else if (e.key === "ArrowRight") { e.preventDefault(); setPanelWidth((w) => clampPanelWidth(w + step)); }
+          }}
+        />
+      )}
 
       {/* Canvas */}
       <div
