@@ -180,6 +180,8 @@ Bootstrap or posterior support values are displayed if internal nodes have numer
 
 Enable **Show support values on branches** in the Options panel to display numeric labels.
 
+Labels with several values separated by `/` are read too. IQ-TREE writes one per test, e.g. `92.7/0.995/93` = SH-aLRT / aBayes / UFBoot. Under **Support colouring**, **Colour by** picks the value that colours and labels the branches (default: the last, UFBoot); the names are guessed and can be edited, and **Branch labels show all values** prints the whole label.
+
 ---
 
 ## Browser compatibility
