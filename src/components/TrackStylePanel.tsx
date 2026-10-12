@@ -34,7 +34,7 @@ function AutoNumber({ value, auto, onChange }: { value: number | null; auto: num
       onChange={(e) => setDraft(e.target.value)}
       onBlur={(e) => commit(e.target.value)}
       onKeyDown={(e) => { if (e.key === "Enter") commit(e.currentTarget.value); }}
-      style={{ width: 92, fontSize: 11 }}
+      style={{ flex: "1 1 0", minWidth: 0, fontSize: 11 }}
     />
   );
 }
@@ -92,6 +92,8 @@ function ScaleRow({ range, stats, onChange }: {
       <div className="style-row">
         <span className="note">Min</span>
         <AutoNumber value={range.min} auto={auto.lo} onChange={(v) => onChange({ min: v })} />
+      </div>
+      <div className="style-row">
         <span className="note">Max</span>
         <AutoNumber value={range.max} auto={auto.hi} onChange={(v) => onChange({ max: v })} />
       </div>
