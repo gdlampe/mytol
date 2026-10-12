@@ -666,3 +666,14 @@ select {
 .decor-panel .style-row { margin-bottom: 4px; }
 .decor-label { min-width: 92px; }
 .decor-heading { font-weight: 600; margin: 8px 0 4px; }
+
+/* Colour key chip icon */
+.color-key-icon {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  background: linear-gradient(90deg, #e15759, #edc948, #59a14f, #4e79a7);
+}

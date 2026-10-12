@@ -14,6 +14,9 @@ import type { AnnotationRow } from "./types";
 //     joined by ";") and, if present, a "<file> length" column.
 //  3. Connections: no id column but source + target columns (also from/to,
 //     node1/node2, leaf1/leaf2), one row per connection between leaves/clades.
+//  4. Colour key: column + value + color columns (no id column). Colours for
+//     the categories of a column; for a numeric column, value "(color)" sets
+//     the bar / field colour and "(low)" "(mid)" "(high)" a gradient.
 // ============================================================
 
 export type Connection = {
@@ -28,9 +31,27 @@ export type Connection = {
   label?: string;
 };
 
+export type ColorKeyEntry = { column: string; value: string; color: string };
+
 export type ParsedAnnotationFile =
   | { kind: "table"; rows: AnnotationRow[]; columns: string[]; note?: string }
-  | { kind: "connections"; connections: Connection[] };
+  | { kind: "connections"; connections: Connection[] }
+  | { kind: "colors"; entries: ColorKeyEntry[]; skipped: number };
+
+/** Hex (#rgb, #rrggbb, #rrggbbaa) or rgb()/rgba() → lowercase hex, else null. */
+export function normalizeColor(s: string): string | null {
+  const t = s.trim();
+  let m = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(t);
+  if (m) {
+    const h = m[1].toLowerCase();
+    return "#" + (h.length === 3 ? [...h].map(c => c + c).join("") : h);
+  }
+  m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)$/i.exec(t);
+  if (!m) return null;
+  const hex = (n: number) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+  const a = m[4] !== undefined ? Number(m[4]) : 1;
+  return `#${hex(+m[1])}${hex(+m[2])}${hex(+m[3])}${a < 1 ? hex(a * 255) : ""}`;
+}
 
 const lc = (s: string) => s.trim().toLowerCase();
 const findCol = (cols: string[], names: string[]) => cols.find(c => names.includes(lc(c)));
@@ -44,6 +65,20 @@ export function parseAnnotationText(text: string, fileName: string): ParsedAnnot
   const isTsv = /\.(tsv|tab|txt)$/i.test(fileName) || (!/\.csv$/i.test(fileName) && text.split("\n", 1)[0].includes("\t"));
   const parsed = isTsv ? d3.tsvParse(text) : d3.csvParse(text);
   const cols = parsed.columns;
+
+  // Colour key: column / value / color, and no id column.
+  const keyCol = findCol(cols, ["column"]), valCol = findCol(cols, ["value"]), colorCol = findCol(cols, ["color", "colour"]);
+  if (keyCol && valCol && colorCol && !findCol(cols, ["id", "name"])) {
+    const entries: ColorKeyEntry[] = [];
+    let skipped = 0;
+    for (const r of parsed) {
+      const column = (r[keyCol] ?? "").trim(), value = (r[valCol] ?? "").trim();
+      const color = normalizeColor(r[colorCol] ?? "");
+      if (column && color) entries.push({ column, value, color });
+      else if (column || value) skipped++;
+    }
+    return { kind: "colors", entries, skipped };
+  }
 
   // Connections: explicit source + target columns win, even if the file also has an id/name column.
   const src = findCol(cols, ["source", "node1", "leaf1", "id1"]) ?? findCol(cols, ["from"]);
@@ -173,6 +208,6 @@ function parseConnections(parsed: d3.DSVRowArray<string>, src: string, tgt: stri
 /** Backwards-compatible wrapper: wide tables only. */
 export async function parseAnnotations(file: File): Promise<{ rows: AnnotationRow[]; columns: string[] }> {
   const p = await parseAnnotationFile(file);
-  if (p.kind !== "table") throw new Error(`${file.name} is a connections file, not an annotation table`);
+  if (p.kind !== "table") throw new Error(`${file.name} is a ${p.kind === "colors" ? "colour key" : "connections"} file, not an annotation table`);
   return { rows: p.rows, columns: p.columns };
 }

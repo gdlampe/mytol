@@ -133,6 +133,9 @@ export const CAT_COLORS = [
 /** Assigns a stable colour from CAT_COLORS based on string hash */
 export function originalCategoryColor(cat?: string): string {
   if (!cat) return "#aaa";
+  // A value that is itself a colour (#rgb / #rrggbb) is drawn in that colour.
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(cat.trim());
+  if (hex) return "#" + (hex[1].length === 3 ? [...hex[1]].map(c => c + c).join("") : hex[1]).toLowerCase();
   const i = Math.abs(hashString(cat)) % CAT_COLORS.length;
   return CAT_COLORS[i];
 }

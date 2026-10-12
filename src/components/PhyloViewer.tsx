@@ -30,6 +30,7 @@ import type {
   PolarCoord,
   TrackConfig,
   EditingColorInfo,
+  ContinuousStyle,
 } from "../lib/types";
 import {
   clamp,
@@ -56,7 +57,7 @@ import {
   rectToPolar,
 } from "../lib/treeLayout";
 import { parseAnnotations, parseAnnotationFile } from "../lib/parseAnnotations";
-import type { Connection } from "../lib/parseAnnotations";
+import type { ColorKeyEntry, Connection } from "../lib/parseAnnotations";
 import {
   DEFAULT_DECOR,
   computeNodeColors,
@@ -144,6 +145,18 @@ function svgRingOutline(cx: number, cy: number, r1: number, r2: number, a0: numb
 }
 
 /** Longest category list drawn per legend section (the rest collapse to "… N more"). */
+/**
+ * Continuous-ring style from a colour key's rows for one column: "(low)" /
+ * "(mid)" / "(high)" give a gradient, "(color)" the bar colour. Null if neither.
+ */
+function keyedContStyle(t: TrackConfig, key: Map<string, string> | undefined): ContinuousStyle | null {
+  if (!key) return null;
+  const low = key.get("(low)"), mid = key.get("(mid)"), high = key.get("(high)"), bar = key.get("(color)");
+  if (low || high) return { ...contStyle(t), mode: "gradient", stops: [low ?? "#ffffff", ...(mid ? [mid] : []), high ?? bar ?? "#000000"] };
+  if (bar) return { ...contStyle(t), barColor: bar };
+  return null;
+}
+
 const LEGEND_MAX_ENTRIES = 100;
 /** Longest item list shown per section in the Legend panel. */
 const LEGEND_PANEL_MAX_ITEMS = 300;
@@ -245,6 +258,21 @@ export default function Phylo() {
   >([]);
   // Connection files (source/target tables) and column-driven tree decorations.
   const [connectionFiles, setConnectionFiles] = useState<Array<{ name: string; connections: Connection[] }>>([]);
+  // Colour key files (column / value / color). Each recolours once when loaded;
+  // ids already applied (or restored from a session) are not applied again.
+  const [colorKeyFiles, setColorKeyFiles] = useState<Array<{ id: string; name: string; entries: ColorKeyEntry[] }>>([]);
+  const appliedColorKeys = useRef(new Set<string>());
+  const colorKey = useMemo(() => {
+    const m = new Map<string, Map<string, string>>();
+    for (const f of colorKeyFiles) for (const e of f.entries) {
+      if (!m.has(e.column)) m.set(e.column, new Map());
+      m.get(e.column)!.set(e.value, e.color);
+    }
+    return m;
+  }, [colorKeyFiles]);
+  // Read by the annotation effect so columns loaded after a key get its colours.
+  const colorKeyRef = useRef(colorKey);
+  colorKeyRef.current = colorKey;
   const [decor, setDecor] = useState<TreeDecor>(DEFAULT_DECOR);
   const patchDecor = (patch: Partial<TreeDecor>) => setDecor(d => ({ ...d, ...patch }));
   const [cladeCol, setCladeCol] = useState<string | null>(null);
@@ -641,7 +669,9 @@ export default function Phylo() {
           return existing;
         }
         if (meta.isContinuous) {
-          return { key: col, label: col, type: "continuous" as const, height: 20, maxVal: meta.maxVal, visible: true };
+          const t: TrackConfig = { key: col, label: col, type: "continuous", height: 20, maxVal: meta.maxVal, visible: true };
+          const cont = keyedContStyle(t, colorKeyRef.current.get(col));
+          return cont ? { ...t, cont } : t;
         }
         // Mostly-unique text (sequences, domain strings, value lists, free text)
         // makes a useless colour strip: start hidden; use it in a multi-column ring instead.
@@ -659,7 +689,7 @@ export default function Phylo() {
         if (meta.isContinuous && !old) continue;
         const colorMap = new Map<string, string>();
         for (const cat of meta.cats) {
-          colorMap.set(cat, old?.get(cat) ?? originalCategoryColor(cat));
+          colorMap.set(cat, old?.get(cat) ?? colorKeyRef.current.get(col)?.get(cat) ?? originalCategoryColor(cat));
         }
         next.set(col, colorMap);
       }
@@ -696,15 +726,52 @@ export default function Phylo() {
     const results = await Promise.allSettled(files.map(f => parseAnnotationFile(f)));
     const added: Array<{ name: string; rows: AnnotationRow[]; columns: string[]; note?: string }> = [];
     const conns: Array<{ name: string; connections: Connection[] }> = [];
+    const keys: Array<{ id: string; name: string; entries: ColorKeyEntry[] }> = [];
+    const stamp = Date.now().toString(36);
     results.forEach((r, i) => {
       if (r.status !== "fulfilled") { console.error(`Failed to parse annotations (${files[i].name}):`, r.reason); return; }
       const p = r.value;
       if (p.kind === "connections") conns.push({ name: files[i].name, connections: p.connections });
+      else if (p.kind === "colors") {
+        if (p.skipped) console.warn(`${files[i].name}: ${p.skipped} colour key rows skipped (no column or not a colour)`);
+        keys.push({ id: `${files[i].name}:${stamp}:${i}`, name: files[i].name, entries: p.entries });
+      }
       else added.push({ name: files[i].name, rows: p.rows, columns: p.columns, note: p.note });
     });
     if (added.length) setAnnotationFiles(prev => [...prev, ...added]);
     if (conns.length) setConnectionFiles(prev => [...prev, ...conns]);
+    if (keys.length) setColorKeyFiles(prev => [...prev, ...keys]);
   };
+
+  // Apply newly loaded colour keys: category colours and continuous ring
+  // colours of matching columns (multi-column rings pick them up when added).
+  useEffect(() => {
+    const fresh = colorKeyFiles.filter(f => !appliedColorKeys.current.has(f.id));
+    if (!fresh.length) return;
+    for (const f of fresh) appliedColorKeys.current.add(f.id);
+    const km = new Map<string, Map<string, string>>();
+    for (const f of fresh) for (const e of f.entries) {
+      if (!km.has(e.column)) km.set(e.column, new Map());
+      km.get(e.column)!.set(e.value, e.color);
+    }
+    setColorMaps(prev => {
+      let changed = false;
+      const next = new Map(prev);
+      for (const [col, m] of km) {
+        const cur = prev.get(col);
+        if (!cur) continue;
+        const upd = new Map(cur);
+        for (const [v, c] of m) if (upd.has(v) && upd.get(v) !== c) { upd.set(v, c); changed = true; }
+        next.set(col, upd);
+      }
+      return changed ? next : prev;
+    });
+    setTrackConfig(prev => prev.map(t => {
+      if (!isColumnRing(t) || t.type !== "continuous") return t;
+      const cont = keyedContStyle(t, km.get(t.key));
+      return cont ? { ...t, cont } : t;
+    }));
+  }, [colorKeyFiles]);
 
   const removeAnnotationFile = (idx: number) => {
     setAnnotationFiles(prev => prev.filter((_, i) => i !== idx));
@@ -3364,9 +3431,26 @@ export default function Phylo() {
     while (trackConfig.some(t => t.key === `ring:${kind}:${n}`)) n++;
     // Keys are never reused (legend state is keyed by them).
     const key = `ring:${kind}:${Date.now().toString(36)}`;
+    // Start from the module defaults, then take colours from any loaded colour key.
+    const opts: Record<string, any> = { ...m.defaults(fields, ringInfo) };
+    for (const f of m.options) {
+      if (f.type === "fieldColors") {
+        const fc: Record<string, string> = {};
+        for (const k of fields) { const c = colorKey.get(k)?.get("(color)"); if (c) fc[k] = c; }
+        if (Object.keys(fc).length) opts[f.key] = { ...(opts[f.key] ?? {}), ...fc };
+      } else if (f.type === "gradient") {
+        const km = colorKey.get(fields[0]);
+        const low = km?.get("(low)"), mid = km?.get("(mid)"), high = km?.get("(high)");
+        if (low || high) opts[f.key] = [low ?? "#ffffff", ...(mid ? [mid] : []), high ?? "#000000"];
+      } else if (f.type === "categoryColors") {
+        const cc: Record<string, string> = {};
+        for (const k of fields) for (const [v, c] of colorKey.get(k) ?? []) if (!v.startsWith("(")) cc[v] = c;
+        if (Object.keys(cc).length) opts[f.key] = { ...(opts[f.key] ?? {}), ...cc };
+      }
+    }
     const ring: TrackConfig = {
       key, kind, fields, label: label.trim() || `${m.title}${n > 1 ? ` ${n}` : ""}`,
-      type: "categorical", height: 40, visible: true, opts: m.defaults(fields, ringInfo),
+      type: "categorical", height: 40, visible: true, opts,
     };
     setTrackConfig(prev => [...prev, ring]);
     setShowLegendKey(key);
@@ -3961,6 +4045,7 @@ export default function Phylo() {
     deletedStyleStash.current.clear();
     setDeletedColumns(new Set());
     setConnectionFiles([]);
+    setColorKeyFiles([]);
     setDecor(DEFAULT_DECOR);
     setTrackConfig(prev => prev.filter(isColumnRing)); // multi-column rings referred to the previous data
     setCollapsedNodes(new Set());
@@ -3999,6 +4084,7 @@ export default function Phylo() {
       showLeafLabels, showTracks, trackOffset, trackOffsetMode, tracksZoomWithTree,
       annotationFiles: annotationFiles.map(stripDeleted),
       connectionFiles,
+      colorKeyFiles,
       decor,
       trackConfig,
       colorMaps: Object.fromEntries(
@@ -4078,6 +4164,10 @@ export default function Phylo() {
         }
         if (s.trackConfig) setTrackConfig(s.trackConfig);
         setConnectionFiles(Array.isArray(s.connectionFiles) ? s.connectionFiles : []);
+        // Restored keys are already reflected in the saved colours: don't re-apply them.
+        const keys = Array.isArray(s.colorKeyFiles) ? s.colorKeyFiles : [];
+        for (const f of keys) appliedColorKeys.current.add(f.id);
+        setColorKeyFiles(keys);
         setDecor({ ...DEFAULT_DECOR, ...(s.decor ?? {}) });
         if (s.colorMaps) {
           const cm = new Map<string, Map<string, string>>();
@@ -4680,6 +4770,17 @@ export default function Phylo() {
                       onClick={() => removeAnnotationFile(idx)}
                       title="Close this annotation file"
                     >×</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            {colorKeyFiles.length > 0 && (
+              <div style={{ marginTop: 4 }}>
+                {colorKeyFiles.map((f, idx) => (
+                  <span key={f.id} className="chip" title={`Colour key: ${f.entries.length} colours for ${new Set(f.entries.map(e => e.column)).size} column(s). Removing it keeps the colours.`}>
+                    <span className="color-key-icon" />
+                    <span style={{ maxWidth: 150, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
+                    <button className="btn" onClick={() => setColorKeyFiles(prev => prev.filter((_, i) => i !== idx))} title="Close this colour key">×</button>
                   </span>
                 ))}
               </div>
