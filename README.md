@@ -23,6 +23,17 @@ I obviously could not have coded this by myself. This was created by passing the
 - **Search**: find and jump to any leaf by name
 - **Export**: PNG and SVG, the SVG files should hopefully be handled nicely by Illustrator.
 
+Added in this fork (`updates` branch):
+
+- **Load several CSV/TSV files at once**, drag rings into any order, hide rings without leaving a gap
+- **Continuous colouring**: gradient presets or custom stops, eyedropper, bar colour, min/max, log scale (any base)
+- **Per-category shading**: shade each category of a ring by a numeric column (e.g. type A white→blue, type B white→red)
+- **Find by annotation**: select leaves by value; on-canvas legend with drag-to-reorder sections and items
+- **Ring borders and gaps**, copy/paste ring styles, delete/restore columns, export the annotations on the tree
+- **Sessions**: save/load everything (data, view, filters, selection, legend, styles) as one JSON file
+- **Several support values per node** (IQ-TREE `SH-aLRT/aBayes/UFBoot`): pick which one colours and labels branches
+- **Resizable side panel**: drag its right edge
+
 ---
 
 ## Try it with the example data
@@ -34,9 +45,10 @@ The `example/` folder contains a ready-to-use tree and annotation file, adapted 
 | File | Description |
 |------|-------------|
 | `example/RTtree.nwk` | Example phylogenetic tree in Newick format |
-| `example/RTtreelabels.csv` | Annotation table (leaf names in first column) |
+| `example/RTtreelabels.csv` | Annotation table (leaf names in the `id` column) |
+| `example/annotations_example.tsv` | Richer table showing gradients, log scale and per-category shading |
 
-Drag and drop `RTtree.nwk` onto the canvas, then drag `RTtreelabels.csv` onto the canvas to add annotations.
+Drag and drop `RTtree.nwk` onto the canvas, then drag `RTtreelabels.csv` onto the canvas to add annotations (or click **Load example data**). [`example/README.md`](example/README.md) walks through every column of `annotations_example.tsv` and how to set it up.
 
 ---
 
@@ -103,6 +115,27 @@ Open your browser and go to **http://localhost:5173**: myTOL will be running.
 
 To stop it, go back to the terminal and press `Ctrl + C`.
 
+### Step 7 (optional): start it with one word
+
+On macOS (zsh), add an alias to `~/.zshrc` so you can start myTOL from any folder by typing `mytol`. Adjust the path to wherever you cloned it:
+
+```zsh
+alias mytol='(cd ~/Packages/mytol && npm run dev)'
+```
+
+Reload your shell with `source ~/.zshrc` (or open a new terminal), then type `mytol` and open **http://localhost:5173**.
+
+To also run the `reboot_itol` branch (iTOL-style rings: heatmaps, domains, alignments…) side by side, clone it into its own folder and give it its own command on a neighbouring port:
+
+```zsh
+git clone -b reboot_itol https://github.com/gdlampe/mytol.git ~/Packages/mitol
+(cd ~/Packages/mitol && npm ci)
+# in ~/.zshrc:
+alias mitol='(cd ~/Packages/mitol && npm run dev -- --port 5174 --strictPort)'
+```
+
+`mitol` then serves **http://localhost:5174**. The two run at the same time, and since they are different addresses, the browser keeps their saved settings separate.
+
 ---
 
 ## Usage
@@ -115,7 +148,7 @@ To stop it, go back to the terminal and press `Ctrl + C`.
 
 ### Annotation CSV format
 
-The first column must be leaf names (matching the tree exactly). Each additional column becomes an annotation track.
+One column named `id` or `name` holds the leaf names (matching the tree exactly). Each other column becomes an annotation track. Use `.csv` (comma) or `.tsv` (tab); blank cells are missing values. You can load several files at once.
 
 ```
 name,habitat,score
@@ -123,6 +156,8 @@ Species_A,forest,0.92
 Species_B,grassland,0.45
 ...
 ```
+
+See [`example/README.md`](example/README.md) for a worked example of every ring style.
 
 ### Keyboard shortcuts
 
