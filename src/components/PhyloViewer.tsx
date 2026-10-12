@@ -56,7 +56,7 @@ import {
   layoutUnrootedEqualAngle,
   rectToPolar,
 } from "../lib/treeLayout";
-import { parseAnnotations, parseAnnotationFile } from "../lib/parseAnnotations";
+import { parseAnnotations, parseAnnotationFile, parseColorList } from "../lib/parseAnnotations";
 import type { ColorKeyEntry, Connection } from "../lib/parseAnnotations";
 import {
   DEFAULT_DECOR,
@@ -3471,6 +3471,61 @@ export default function Phylo() {
   const patchTrack = (key: string, patch: Partial<TrackConfig>) =>
     setTrackConfig(prev => prev.map(t => (t.key === key ? { ...t, ...patch } : t)));
 
+  // Load colours into one ring only (Style → Load colours…), so a colour file
+  // never recolours other columns that share category names.
+  const [ringColorNote, setRingColorNote] = useState<{ key: string; text: string } | null>(null);
+  const loadRingColors = async (t: TrackConfig, file: File) => {
+    const { entries, skipped } = parseColorList(await file.text());
+    // A colour key that names columns: use the rows for this ring if there are any.
+    const names = new Set([t.key, t.label, ...(t.fields ?? [])]);
+    const mine = entries.filter(e => !e.column || names.has(e.column));
+    const use = mine.length ? mine : entries;
+    const byValue = new Map(use.map(e => [e.value, e.color]));
+    const note = (applied: number, of: number, what: string) =>
+      setRingColorNote({ key: t.key, text: `${file.name}: ${applied} of ${of} colours applied${what}${skipped ? ` (${skipped} rows without a colour)` : ""}` });
+    if (isColumnRing(t) && t.type === "categorical") {
+      const cur = colorMaps.get(t.key) ?? new Map<string, string>();
+      const hits = [...byValue].filter(([v]) => cur.has(v));
+      setColorMaps(prev => {
+        const next = new Map(prev);
+        const m = new Map(prev.get(t.key) ?? []);
+        for (const [v, c] of hits) m.set(v, c);
+        next.set(t.key, m);
+        return next;
+      });
+      const missing = byValue.size - hits.length;
+      note(hits.length, byValue.size, missing ? `; ${missing} values are not in this ring` : "");
+    } else if (isColumnRing(t)) {
+      const cont = keyedContStyle(t, byValue);
+      if (cont) patchTrack(t.key, { cont });
+      note(cont ? 1 : 0, 1, cont ? "" : ' — a numeric ring needs "(color)" or "(low)" / "(high)" rows');
+    } else {
+      const m = ringModule(t);
+      const opts: Record<string, any> = { ...(t.opts ?? {}) };
+      let applied = 0;
+      for (const f of m.options) {
+        if (f.type === "fieldColors") {
+          const fc: Record<string, string> = { ...(opts[f.key] ?? {}) };
+          for (const k of t.fields ?? []) {
+            const c = byValue.get(k) ?? entries.find(e => e.column === k && e.value === "(color)")?.color;
+            if (c) { fc[k] = c; applied++; }
+          }
+          opts[f.key] = fc;
+        } else if (f.type === "gradient") {
+          const low = byValue.get("(low)"), mid = byValue.get("(mid)"), high = byValue.get("(high)");
+          if (low || high) { opts[f.key] = [low ?? "#ffffff", ...(mid ? [mid] : []), high ?? "#000000"]; applied++; }
+        } else if (f.type === "categoryColors") {
+          const cats = new Set(m.categories?.(t, f.key, ringInfo) ?? []);
+          const cc: Record<string, string> = { ...(opts[f.key] ?? {}) };
+          for (const [v, c] of byValue) if (cats.has(v)) { cc[v] = c; applied++; }
+          opts[f.key] = cc;
+        }
+      }
+      patchTrack(t.key, { opts });
+      note(applied, byValue.size, "");
+    }
+  };
+
   // Columns with numeric values (for "shade by").
   const numericColumns = columnRings
     .filter(t => (numStats.get(t.key)?.count ?? 0) > 0)
@@ -5426,6 +5481,12 @@ export default function Phylo() {
                               : `Paste the style copied from “${styleClip.fromLabel}”`}
                             onClick={() => pasteStyleTo(track)}
                           >Paste style{styleClip && clipFits(track) ? ` (${styleClip.fromLabel})` : ""}</button>
+                          <label className="btn" style={{ cursor: "pointer" }}
+                            title="Load colours from a file into this ring only: rows of value + colour (e.g. UG9 #f04f27), or a colour key (column / value / color)">
+                            Load colours…
+                            <input type="file" accept=".tsv,.csv,.txt" style={{ display: "none" }}
+                              onChange={(e) => { const f = e.target.files?.[0]; if (f) loadRingColors(track, f); e.target.value = ""; }} />
+                          </label>
                           {isColumnRing(track) ? (
                             <button type="button" className="btn btn-danger" style={{ marginLeft: "auto" }}
                               title="Remove this annotation column (restore it from the list below)"
@@ -5438,6 +5499,7 @@ export default function Phylo() {
                             >Remove ring</button>
                           )}
                         </div>
+                        {ringColorNote?.key === track.key && <div className="note" style={{ marginTop: 4 }}>{ringColorNote.text}</div>}
                       </div>
                     )}
                   </div>

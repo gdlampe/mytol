@@ -56,6 +56,42 @@ export function normalizeColor(s: string): string | null {
 const lc = (s: string) => s.trim().toLowerCase();
 const findCol = (cols: string[], names: string[]) => cols.find(c => names.includes(lc(c)));
 
+/**
+ * Colours for one ring (its Style panel → Load colours…). Accepts a colour key
+ * (column / value / color header), a value / color header, or plain rows such
+ * as "UG9<tab>#f04f27": the colour is the cell that parses as one, the value
+ * the last other non-empty cell (so iTOL strip rows "id colour label" give the
+ * label). Rows without a colour are skipped. column is "" when not given.
+ */
+export function parseColorList(text: string): { entries: ColorKeyEntry[]; skipped: number } {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).filter(l => l.trim() !== "" && !l.startsWith("#!"));
+  const sep = (l: string) => (l.includes("\t") ? l.split("\t") : l.includes(",") && !/rgba?\(/i.test(l) ? l.split(",") : l.trim().split(/\s+/)).map(c => c.trim());
+  const entries: ColorKeyEntry[] = [];
+  let skipped = 0;
+  if (!lines.length) return { entries, skipped };
+  const head = sep(lines[0]).map(c => c.toLowerCase());
+  const ci = head.findIndex(h => h === "color" || h === "colour");
+  const vi = head.indexOf("value");
+  const ki = head.indexOf("column");
+  if (ci >= 0 && vi >= 0) {
+    for (const l of lines.slice(1)) {
+      const cells = sep(l);
+      const color = normalizeColor(cells[ci] ?? "");
+      if (color) entries.push({ column: ki >= 0 ? cells[ki] ?? "" : "", value: cells[vi] ?? "", color });
+      else skipped++;
+    }
+    return { entries, skipped };
+  }
+  for (const l of lines) {
+    const cells = sep(l).filter(c => c !== "");
+    const ci2 = cells.findIndex(c => normalizeColor(c));
+    const rest = cells.filter((_, i) => i !== ci2);
+    if (ci2 < 0 || !rest.length) { skipped++; continue; }
+    entries.push({ column: "", value: rest[rest.length - 1], color: normalizeColor(cells[ci2])! });
+  }
+  return { entries, skipped };
+}
+
 export async function parseAnnotationFile(file: File): Promise<ParsedAnnotationFile> {
   const text = await file.text();
   return parseAnnotationText(text, file.name);
