@@ -126,7 +126,6 @@ function svgRingOutline(cx: number, cy: number, r1: number, r2: number, a0: numb
   return `M ${P(r2, a0)} A ${f(r2)},${f(r2)} 0 ${large},1 ${P(r2, a1)} L ${P(r1, a1)} A ${f(r1)},${f(r1)} 0 ${large},0 ${P(r1, a0)} Z`;
 }
 
-/** Longest category list drawn per legend section (the rest collapse to "… N more"). */
 // Side panel width limits (px) and where the chosen width is remembered.
 const PANEL_DEFAULT_W = 260;
 const PANEL_MIN_W = 200;
@@ -139,6 +138,7 @@ const clampPanelWidth = (w: number) =>
 /** Legend entry id of a coloured range (ranges are grouped by label + colour). */
 const rangeEntryId = (label: string, color: string) => `ranges\x00${label}\x00${color}`;
 
+/** Longest category list drawn per legend section (the rest collapse to "… N more"). */
 const LEGEND_MAX_ENTRIES = 100;
 /** Longest item list shown per section in the Legend panel. */
 const LEGEND_PANEL_MAX_ITEMS = 300;
