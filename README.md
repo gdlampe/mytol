@@ -36,6 +36,14 @@ Added in this fork (`updates` branch):
 - **Coloured ranges**: opacity, extend past the edge and rounded corners; colour or collapse every clade of a column at once (split groups give one clade per piece); one clean shape per range in the SVG
 - **Branch colour** option
 
+Added on the `reboot_itol` branch (run it as `mitol`, see Step 7): iTOL-style annotations, all from ordinary TSV columns, still fast on very large trees.
+
+- **Multi-column rings**: heatmaps, multi-value bars, binary presence/absence shapes, shapes sized by value, pie charts, text labels, **protein domain architectures**, box plots, line charts and **sequence alignments**
+- **Tree decorations from columns**: branch colour and width, label colour / background / bold-italic / rename, node symbols, node pies, coloured ranges or collapsed clades from a column; a row id `A|B` means the clade of leaves A and B
+- **Connections** between leaves or clades from a `source` / `target` file; **long domain tables** (InterProScan / hmmscan style, one row per domain) are converted automatically
+- **Colour keys**: a `column` / `value` / `color` TSV sets category, bar and gradient colours; **Style → Load colours…** loads colours into one ring only
+- **Scripts** to bring iTOL data across: `scripts/itol2tsv.py` (iTOL annotation files → TSVs + colour key) and `scripts/clades2ring.py` (clade table → a coloured clade ring)
+
 ---
 
 ## Try it with the example data
@@ -160,6 +168,37 @@ Species_B,grassland,0.45
 ```
 
 See [`example/README.md`](example/README.md) for a worked example of every ring style.
+
+### iTOL-style rings and decorations (`reboot_itol`)
+
+Everything is set up from your columns in the app, no iTOL annotation files needed:
+
+1. Load the tree and your TSV files (**Annotations → Add files…**, several at once).
+2. **Annotation Tracks → + Add ring…**: pick a ring type, tick its columns, **Add ring**. Each ring's **Style ▾** has its options.
+3. **Tree decorations** (below the rings) picks columns for branch colours, label styles, symbols, pies, clades and connections.
+
+[`example/itol/README.md`](example/itol/README.md) has one small example file per ring type and decoration, with the cell formats (domains like `KH:27-157;RT:310-405`, number lists for box plots and line charts, aligned sequences, `A|B` clade rows) and the exact clicks.
+
+**Colours.** A colour key is a TSV with `column`, `value` and `color` columns:
+
+```
+column	value	color
+Phylum	Pseudomonadota	#4e79a7
+Protein length (aa)	(color)	#4e79a7
+Defense fraction	(low)	#f7f7f7
+Defense fraction	(high)	#b2182b
+```
+
+Load it with the data and it colours the categories of the columns it names; `(color)` sets a numeric ring's bar colour (or a field's colour in a multi-column ring), `(low)` / `(mid)` / `(high)` a gradient. It is applied once, so later edits by hand win. To colour just one ring, use its **Style ▾ → Load colours…**, which also takes a plain two-column `value` / `colour` list.
+
+**Converting from iTOL.** With Python 3 (nothing to install):
+
+```
+python3 scripts/itol2tsv.py path/to/itol_files/ --tree tree.nwk -o path/to/mitol_converted
+python3 scripts/clades2ring.py clades.tsv --tree tree.nwk --name "UG clade" -o path/to/mitol_converted
+```
+
+`itol2tsv.py` turns each iTOL dataset file (colour strips, bars, gradients, heatmaps, binary, pies, symbols, domains, connections, styles, labels, alignments, …) into a TSV plus one shared `colors.tsv`, and writes a `README.md` in the output folder saying which ring or decoration to use for each. `clades2ring.py` turns rows of "two leaves + colour + name" (iTOL-style ranges) into a ring with every leaf of each clade labelled; it re-roots at the midpoint when a clade would otherwise straddle an arbitrary root (as in IQ-TREE output). Select every file in the output folder in **Add files…**.
 
 ### Keyboard shortcuts
 
