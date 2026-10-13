@@ -414,6 +414,8 @@ export default function Phylo() {
   const [rangeRound, setRangeRound] = useState(0);
   // Background ranges drawn behind the branches (default) or in front of them.
   const [rangeInFront, setRangeInFront] = useState(false);
+  // Warning shown over the canvas when rings are drawn in the unrooted layout (can be dismissed).
+  const [unrootedRingWarningHidden, setUnrootedRingWarningHidden] = useState(false);
   // Default branch colour (where no range or support colour applies).
   const [optBranchColor, setOptBranchColor] = useState("#333333");
   // Coloured Ranges → "From a column": collapse / colour every uniform clade of a column.
@@ -4934,6 +4936,12 @@ export default function Phylo() {
           </div>
           {sectionOpen.tracks && (
             <div className="row">
+              {layout === "unrooted" && showTracks && (
+                <div className="warn-note" style={{ marginBottom: 8 }}>
+                  <b>Unrooted layout:</b> rings place each leaf by its order around the circle, not next to its branch, so they
+                  don't line up with the tree. Don't read clade membership from them; use <b>Rect</b> or <b>Circ</b> for that.
+                </div>
+              )}
               <div style={{ marginBottom: 8 }}>
                 <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 6 }}>
                   <input type="checkbox" checked={tracksZoomWithTree} onChange={(e) => setTracksZoomWithTree(e.target.checked)} />
@@ -5355,6 +5363,16 @@ export default function Phylo() {
           if (annFiles.length) addAnnotationFiles(annFiles);
         }}
       >
+        {tree && layout === "unrooted" && showTracks && trackConfig.some(t => t.visible) && !unrootedRingWarningHidden && (
+          <div className="canvas-warning" role="note">
+            <span>
+              <b>Rings don't line up with an unrooted tree.</b> Each leaf's ring cell sits at its position in the leaf order
+              around the circle, not next to its branch. Use them for an overview only; switch to <b>Rect</b> or <b>Circ</b> to
+              read annotations against clades.
+            </span>
+            <button type="button" className="btn" title="Hide this warning" onClick={() => setUnrootedRingWarningHidden(true)}>×</button>
+          </div>
+        )}
         {!tree && (
           <div className={"drop-zone-hint" + (isDragOver ? " drag-over" : "")}>
             <div className="drop-zone-hint-text">
