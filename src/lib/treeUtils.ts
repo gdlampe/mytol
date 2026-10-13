@@ -166,6 +166,61 @@ export function buildTree(ast: any): Tree {
   return tree;
 }
 
+/**
+ * Largest clades whose leaves all share one value (leafValue → null = none).
+ * A value found in several places gives one clade per piece; single leaves and
+ * the root are never returned. minSize counts all leaves with the value, so the
+ * small pieces of a big split group still count. splitAcrossRoot lists values
+ * whose leaves sit under different children of the root (re-rooting may join them).
+ */
+export function uniformClades(
+  tree: Tree,
+  leafValue: (leafId: number) => string | null,
+  minSize: number
+): { clades: Array<{ nodeId: number; value: string; size: number }>; splitAcrossRoot: string[] } {
+  const val: Array<string | null> = new Array(tree.nodes.length).fill(null);
+  const order: number[] = [];
+  const stack = [tree.root];
+  while (stack.length) { const u = stack.pop()!; order.push(u); for (const c of tree.nodes[u].children) stack.push(c); }
+  const total = new Map<string, number>();
+  for (let i = order.length - 1; i >= 0; i--) {
+    const nd = tree.nodes[order[i]];
+    if (nd.isLeaf || nd.children.length === 0) {
+      const v = leafValue(nd.id);
+      val[nd.id] = v;
+      if (v !== null) total.set(v, (total.get(v) ?? 0) + 1);
+      continue;
+    }
+    const v0 = val[nd.children[0]];
+    val[nd.id] = v0 !== null && nd.children.every(c => val[c] === v0) ? v0 : null;
+  }
+  const clades: Array<{ nodeId: number; value: string; size: number }> = [];
+  const walk = [tree.root];
+  while (walk.length) {
+    const u = walk.pop()!;
+    const nd = tree.nodes[u];
+    const v = val[u];
+    if (u !== tree.root && v !== null && !nd.isLeaf && (total.get(v) ?? 0) >= minSize) {
+      clades.push({ nodeId: u, value: v, size: nd.R - nd.L });
+      continue;
+    }
+    for (const c of nd.children) walk.push(c);
+  }
+  // Values whose leaves fall under more than one child of the root.
+  const under = new Map<string, Set<number>>();
+  for (const c of tree.nodes[tree.root].children) {
+    const st = [c];
+    while (st.length) {
+      const u = st.pop()!;
+      const nd = tree.nodes[u];
+      if (nd.isLeaf) { const v = val[u]; if (v !== null) { if (!under.has(v)) under.set(v, new Set()); under.get(v)!.add(c); } }
+      else st.push(...nd.children);
+    }
+  }
+  const splitAcrossRoot = [...under].filter(([, s]) => s.size > 1).map(([v]) => v);
+  return { clades, splitAcrossRoot };
+}
+
 /** Numbers in a support label ("95", "0.95", "92.7/0.995/93", "/95"), or null if it isn't one. */
 export function parseSupportLabel(label: string): number[] | null {
   const parts = label.split("/").map(p => p.trim());

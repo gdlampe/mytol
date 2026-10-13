@@ -52,7 +52,9 @@ import {
   rerootAtNode,
   supportValue,
   guessSupportNames,
+  uniformClades,
 } from "../lib/treeUtils";
+import { rectRangeShape, sectorRangeShape, hullRangeShape, polygonPathData, fillScreenPolygon, unrootedRangePoints } from "../lib/rangeShape";
 import {
   layoutRectangular,
   layoutUnrootedEqualAngle,
@@ -68,7 +70,6 @@ import {
   labelStyleOf,
   nodeNameIndex,
   resolveNodeRef,
-  uniformClades,
 } from "../lib/decorations";
 import type { TreeDecor } from "../lib/decorations";
 import { FIELD_PALETTE } from "../lib/rings/util";
@@ -289,8 +290,6 @@ export default function Phylo() {
   colorKeyRef.current = colorKey;
   const [decor, setDecor] = useState<TreeDecor>(DEFAULT_DECOR);
   const patchDecor = (patch: Partial<TreeDecor>) => setDecor(d => ({ ...d, ...patch }));
-  const [cladeCol, setCladeCol] = useState<string | null>(null);
-  const [cladeMin, setCladeMin] = useState(3);
 
   // Bug fix: store raw text so ladderize changes don't re-read from disk
   const [newickText, setNewickText] = useState<string | null>(null);
@@ -461,6 +460,15 @@ export default function Phylo() {
   const [optSupportColouring, setOptSupportColouring] = useState(true);
   const [optTaperBranches, setOptTaperBranches] = useState(true);
   const [rangeDisplayMode, setRangeDisplayMode] = useState<"background" | "branches">("background");
+  // Background ranges: opacity, how far the shape extends past its edge (px), corner rounding (px).
+  const [rangeOpacity, setRangeOpacity] = useState(0.33);
+  const [rangeExtend, setRangeExtend] = useState(0);
+  const [rangeRound, setRangeRound] = useState(0);
+  // Default branch colour (where no range or support colour applies).
+  const [optBranchColor, setOptBranchColor] = useState("#333333");
+  // Coloured Ranges → "From a column": collapse / colour every uniform clade of a column.
+  const [cladeCol, setCladeCol] = useState<string | null>(null);
+  const [cladeMin, setCladeMin] = useState(2);
 
   const [panelVisible, setPanelVisible] = useState(true);
   // Side panel width (drag its right edge); remembered per browser.
@@ -1025,6 +1033,15 @@ export default function Phylo() {
   /** Branch label: the chosen value as written in the tree, or all of them. */
   const supportLabel = (nd: Node) =>
     supportLabelsAll ? (nd.supports ?? []).map(fmtSupport).join("/") : fmtSupport(nd.supports?.[supportIdx] ?? NaN);
+  // Coloured Ranges → "From a column": uniform clades of a categorical column.
+  const cladesFromColumn = useMemo(() => {
+    if (!tree || !cladeCol) return null;
+    return uniformClades(tree, id => {
+      const v = annotations.get(tree.nodes[id].name || "")?.[cladeCol];
+      return v === undefined || v === null || v === "" ? null : String(v);
+    }, cladeMin);
+  }, [tree, annotations, cladeCol, cladeMin]);
+
   /** "SH-aLRT 92.7 · aBayes 0.995 · UFBoot 93" (tooltips, selection info). */
   const supportText = (nd: Node) =>
     (nd.supports ?? []).map((v, i) => (supportCount > 1 ? `${supportNameList[i] ?? `Value ${i + 1}`} ${fmtSupport(v)}` : fmtSupport(v))).join(" · ");
@@ -1126,15 +1143,6 @@ export default function Phylo() {
     const st = labelStyleOf(leafRow(leafId)?.[decor.labelStyleBy]);
     return st.bold || st.italic ? st : null;
   };
-
-  // Clades for "Clades from a column" (memoised: the panel re-renders on every hover).
-  const uniformCladeList = useMemo(() => {
-    if (!tree || !cladeCol) return [];
-    return uniformClades(tree, id => {
-      const v = annotations.get(tree.nodes[id].name || "")?.[cladeCol];
-      return v === undefined || v === null || v === "" ? null : String(v);
-    }, cladeMin);
-  }, [tree, annotations, cladeCol, cladeMin]);
 
   // Connections resolved to node ids.
   const resolvedConnections = useMemo(() => {
@@ -1256,7 +1264,7 @@ export default function Phylo() {
       });
       const entries: LegendEntry[] = [...groups].map(([key, g]) => {
         const edit: LegendEditTarget = { type: "ranges", indices: g.indices };
-        return { id: rangeEntryId(g.label, g.color), label: g.label, color: g.color, fillAlpha: rangeDisplayMode === "background" ? 0.33 : 1, edit };
+        return { id: rangeEntryId(g.label, g.color), label: g.label, color: g.color, fillAlpha: rangeDisplayMode === "background" ? rangeOpacity : 1, edit };
       });
       sections.push({ id: "ranges", title: text("ranges", "Coloured ranges"), kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder["ranges"]), more: 0 });
     }
@@ -1305,7 +1313,7 @@ export default function Phylo() {
     tree, legendLabels, legendOnlyPresent, legendOrder, legendEntryOrder,
     showTracks, trackConfig, colorMaps, presentCategories, numStats, annotationRows, columnRings,
     decor.symbolBy, decor.symbolShape, decor.symbolFilled, decor.pieFields,
-    ranges, rangeDisplayMode,
+    ranges, rangeDisplayMode, rangeOpacity,
     optSupportColouring, treeHasSupport, supportAsPercent,
     supportC0, supportC1, supportC2, supportV0, supportV1, supportV2,
     supportCount, supportNameList, supportIdx,
@@ -1844,7 +1852,7 @@ export default function Phylo() {
 
     // Branch colour: range override → support colour → default
     const nodeColor = (id: number, support?: number): string =>
-      nodeRangeColor.get(id) ?? decorBranchColors?.[id] ?? (optSupportColouring && support !== undefined ? supportColor(support) : "#333");
+      nodeRangeColor.get(id) ?? decorBranchColors?.[id] ?? (optSupportColouring && support !== undefined ? supportColor(support) : optBranchColor);
 
     // Leaf label colour: annotation-search match → label-colour column → range colour → default
     const matchFlag = annHighlight && annMatches ? annMatches.flag : null;
@@ -2052,12 +2060,14 @@ export default function Phylo() {
       for (const r of ranges) {
         if (rangeDisplayMode !== "background") continue;
         const nd = nodes[r.nodeId];
+        if (!nd) continue;
+        // Screen space (the SVG export draws the same shape).
         const a = (rectCoords as any)[nd.id];
-        const xNode = -W / 2 + PADDING + sx * a.x;
-        const y1 = -H / 2 + PADDING + sy * nd.L;
-        const y2 = -H / 2 + PADDING + sy * (nd.R - 1) + sy;
-        ctx.fillStyle = r.color + "55";
-        ctx.fillRect(xNode, y1, trackRightEdgeX - xNode, y2 - y1);
+        const cx = W / 2 + offset.x, cy = H / 2 + offset.y;
+        const xNode = cx + (-W / 2 + PADDING + sx * a.x);
+        const y1 = cy + vZoom * (-H / 2 + PADDING + sy * nd.L);
+        const y2 = cy + vZoom * (-H / 2 + PADDING + sy * (nd.R - 1) + sy);
+        fillScreenPolygon(ctx, rectRangeShape(xNode, y1, cx + trackRightEdgeX, y2, rangeExtend, rangeRound), r.color, rangeOpacity);
       }
 
       for (const nd of nodes) {
@@ -2156,12 +2166,8 @@ export default function Phylo() {
         const a1 = (startAngleDeg * Math.PI) / 180 - (nd.R / N) * ((arcDeg * Math.PI) / 180);
         const aRect = (rectCoords as any)[nd.id];
         const rNode = rectToPolar(rectMaxX > 0 ? aRect.x / rectMaxX : 0, aRect.y, N, R, startAngleDeg, arcDeg).radius;
-        ctx.beginPath();
-        ctx.arc(0, 0, trackOuterRadius, a1, a0, false);
-        ctx.arc(0, 0, Math.max(0, rNode), a0, a1, true);
-        ctx.closePath();
-        ctx.fillStyle = r.color + "55";
-        ctx.fill();
+        const shape = sectorRangeShape(W / 2 + offset.x, H / 2 + offset.y, Math.max(0, rNode) * gZoom, trackOuterRadius * gZoom, a0, a1, rangeExtend, rangeRound);
+        fillScreenPolygon(ctx, shape, r.color, rangeOpacity);
       }
 
       // Root dot
@@ -2368,23 +2374,17 @@ export default function Phylo() {
       for (const r of ranges) {
         if (rangeDisplayMode !== "background") continue;
         const nd = nodes[r.nodeId];
-        if (!nd) continue;
-        const points: [number, number][] = [];
-        for (let i = nd.L; i < nd.R; i++) {
-          const leafId = leaves[i];
-          const p = coords[leafId];
-          points.push([p.x * R, p.y * R]);
-        }
-        points.push([coords[nd.id].x * R, coords[nd.id].y * R]);
+        if (!nd || skipNode[nd.id] === 2) continue;
+        // Hull of what is drawn (world units, kept for picking): visible leaves + collapsed circles.
+        const collapsedR = (id: number) =>
+          Math.max(3, Math.min((nodes[id].R - nodes[id].L) * anglePerLeaf * trackOuterRingR * 0.15, 12)) / gZoom;
+        const points = unrootedRangePoints(nd.id, nodes, skipNode, id => [coords[id].x * R, coords[id].y * R], collapsedR);
         const hull = d3.polygonHull(points);
         if (!hull) continue;
         (r as any).hull = hull;
-        ctx.beginPath();
-        ctx.moveTo(hull[0][0], hull[0][1]);
-        for (let i = 1; i < hull.length; i++) ctx.lineTo(hull[i][0], hull[i][1]);
-        ctx.closePath();
-        ctx.fillStyle = r.color + "55";
-        ctx.fill();
+        const ux = W / 2 + offset.x, uy = H / 2 + offset.y;
+        const screenHull = hull.map(([hx, hy]) => [ux + gZoom * hx, uy + gZoom * hy] as [number, number]);
+        fillScreenPolygon(ctx, hullRangeShape(screenHull, rangeExtend, rangeRound), r.color, rangeOpacity);
       }
     }
 
@@ -2748,6 +2748,7 @@ export default function Phylo() {
     annMatches, annHighlight, annHighlightColor, annStepTargets, annDotSize,
     legendModel, legendPos, legendFontSize, legendColumns, legendBox,
     viewSize, nodeSupport, supportLabelsAll,
+    rangeOpacity, rangeExtend, rangeRound, optBranchColor,
   ]);
 
   // ==========================================================
@@ -3710,6 +3711,19 @@ export default function Phylo() {
     const f = (n: number) => n.toFixed(2);
     const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+    // Background ranges: one filled path per range (the on-screen shape), named after the range.
+    const svgRanges = (out: string[], shapeOf: (r: ColoredRange) => [number, number][] | null, fmt: (n: number) => string, escape: (s: string) => string) => {
+      out.push('<g id="coloured-ranges">');
+      ranges.forEach((r, i) => {
+        if (!tree.nodes[r.nodeId]) return;
+        const shape = shapeOf(r);
+        if (!shape || shape.length < 3) return;
+        const name = r.label || `Range ${i + 1}`;
+        out.push(`<path id="range-${i + 1}" fill="${r.color}" fill-opacity="${+rangeOpacity.toFixed(3)}" d="${polygonPathData(shape, fmt)}"><title>${escape(name)}</title></path>`);
+      });
+      out.push('</g>');
+    };
+
     // Rebuild skipNode (same logic as draw())
     const skipNode = new Uint8Array(tree.nodes.length);
     {
@@ -3735,7 +3749,7 @@ export default function Phylo() {
     const rangeBranch = rangeBranchColors(tree);
     const svgBranchColor = (id: number) =>
       rangeBranch.get(id) ?? decorBranchColors?.[id] ??
-      (optSupportColouring && nodeSupport[id] !== undefined ? supportColor(nodeSupport[id]!) : "#333");
+      (optSupportColouring && nodeSupport[id] !== undefined ? supportColor(nodeSupport[id]!) : optBranchColor);
 
     // One leaf label (renamed text, colour, style, optional background box).
     const measureCtx = canvasRef.current?.getContext("2d") ?? null;
@@ -3789,13 +3803,13 @@ export default function Phylo() {
       const visLeafEnd   = clamp(Math.ceil((bottomWy + H / 2 - PADDING) / sy) + 1, 0, tree.leaves.length);
 
       // Colored ranges
-      lines.push('<g id="ranges">');
-      for (const r of ranges) {
-        const nd = tree.nodes[r.nodeId]; const a = (coords as any)[nd.id];
-        const x1 = nsX(a.x), y1 = nsY(nd.L), y2 = nsY(nd.R - 1) + leafSpacingPx;
-        lines.push(`<rect x="${f(x1)}" y="${f(y1)}" width="${f(W - x1)}" height="${f(y2 - y1)}" fill="${r.color}" opacity="0.33"/>`);
+      if (rangeDisplayMode === "background") {
+        const trackRight = cx + computeRectTrackStartX(W, sx, rectMaxX) + effectiveTrackW;
+        svgRanges(lines, (r) => {
+          const nd = tree.nodes[r.nodeId]; const a = (coords as any)[nd.id];
+          return rectRangeShape(nsX(a.x), nsY(nd.L), trackRight, nsY(nd.R - 1) + leafSpacingPx, rangeExtend, rangeRound);
+        }, f, esc);
       }
-      lines.push('</g>');
 
       // Branches — stroked paths, LOD-culled like canvas.
       // vPaths: vertical clade-connector lines (stroke-width = lw)
@@ -3883,21 +3897,14 @@ export default function Phylo() {
       const lw = optBranchThickness;
 
       // Colored ranges
-      lines.push('<g id="ranges">');
-      for (const r of ranges) {
-        const nd = tree.nodes[r.nodeId];
-        const a0 = (startAngleDeg * Math.PI) / 180 - (nd.L / N) * arcRad;
-        const a1 = (startAngleDeg * Math.PI) / 180 - (nd.R / N) * arcRad;
-        const rNode = getPolar(nd.id).radius * gZoom;
-        const rOuter = trackOuterRadius * gZoom;
-        const large = (a0 - a1) > Math.PI ? 1 : 0;
-        const [ox1, oy1] = [cx + rOuter * Math.cos(a1), cy + rOuter * Math.sin(a1)];
-        const [ox2, oy2] = [cx + rOuter * Math.cos(a0), cy + rOuter * Math.sin(a0)];
-        const [ix1, iy1] = [cx + rNode * Math.cos(a0), cy + rNode * Math.sin(a0)];
-        const [ix2, iy2] = [cx + rNode * Math.cos(a1), cy + rNode * Math.sin(a1)];
-        lines.push(`<path fill="${r.color}" opacity="0.33" d="M ${f(ox1)},${f(oy1)} A ${f(rOuter)},${f(rOuter)} 0 ${large},1 ${f(ox2)},${f(oy2)} L ${f(ix1)},${f(iy1)} A ${f(rNode)},${f(rNode)} 0 ${large},0 ${f(ix2)},${f(iy2)} Z"/>`);
+      if (rangeDisplayMode === "background") {
+        svgRanges(lines, (r) => {
+          const nd = tree.nodes[r.nodeId];
+          const a0 = (startAngleDeg * Math.PI) / 180 - (nd.L / N) * arcRad;
+          const a1 = (startAngleDeg * Math.PI) / 180 - (nd.R / N) * arcRad;
+          return sectorRangeShape(cx, cy, Math.max(0, getPolar(nd.id).radius) * gZoom, trackOuterRadius * gZoom, a0, a1, rangeExtend, rangeRound);
+        }, f, esc);
       }
-      lines.push('</g>');
 
       // Branches — batch by colour, LOD-culled like canvas
       const bPaths = new Map<string, string[]>();
@@ -3991,23 +3998,18 @@ export default function Phylo() {
       const anglePerLeaf = (2 * Math.PI) / N;
 
       // Colored ranges — convex hull of leaf positions + clade root
-      lines.push('<g id="ranges">');
-      for (const r of ranges) {
-        const nd = tree.nodes[r.nodeId];
-        if (!nd) continue;
-        const points: [number, number][] = [];
-        for (let i = nd.L; i < nd.R; i++) {
-          const leafId = tree.leaves[i];
-          const p = coords[leafId];
-          points.push([p.x * R, p.y * R]);
-        }
-        points.push([coords[nd.id].x * R, coords[nd.id].y * R]);
-        const hull = d3.polygonHull(points);
-        if (!hull) continue;
-        const hullPts = hull.map(([hx, hy]) => `${f(cx + gZoom * hx)},${f(cy + gZoom * hy)}`).join(" ");
-        lines.push(`<polygon fill="${r.color}" opacity="0.33" points="${hullPts}"/>`);
+      if (rangeDisplayMode === "background") {
+        svgRanges(lines, (r) => {
+          const nd = tree.nodes[r.nodeId];
+          if (skipNode[nd.id] === 2) return null;
+          const collapsedR = (id: number) =>
+            Math.max(3, Math.min((tree.nodes[id].R - tree.nodes[id].L) * anglePerLeaf * trackOuterRingR * 0.15, 12));
+          const points = unrootedRangePoints(nd.id, tree.nodes, skipNode,
+            id => [cx + gZoom * coords[id].x * R, cy + gZoom * coords[id].y * R], collapsedR);
+          const hull = d3.polygonHull(points);
+          return hull ? hullRangeShape(hull, rangeExtend, rangeRound) : null;
+        }, f, esc);
       }
-      lines.push('</g>');
 
       // Branches — batch by colour, LOD-culled like canvas
       const bPaths = new Map<string, string[]>();
@@ -4225,6 +4227,7 @@ export default function Phylo() {
       collapsedFingerprints: [...collapsedNodes].map((id) => nodeToFingerprint(tree, id)),
       ranges: ranges.map((r) => ({ fp: nodeToFingerprint(tree, r.nodeId), color: r.color, label: r.label })),
       rangeDisplayMode, rangeColorTrackKey,
+      rangeStyle: { opacity: rangeOpacity, extend: rangeExtend, round: rangeRound },
       hiddenLeafNames: [...hiddenLeafNames],
       selectedFingerprint: selectedNode !== null && tree.nodes[selectedNode] ? nodeToFingerprint(tree, selectedNode) : null,
       search: {
@@ -4239,6 +4242,7 @@ export default function Phylo() {
       options: {
         fontScale: optFontScale, lodMinPx: optLodMinPx, branchThickness: optBranchThickness, barFill: optBarFill,
         pctIncludeUnlabelled: optPctIncludeUnlabelled, background: optBackground, taperBranches: optTaperBranches,
+        branchColor: optBranchColor,
         exportScale,
       },
     };
@@ -4324,6 +4328,9 @@ export default function Phylo() {
           setLegendEntryOrder(L.entryOrder && typeof L.entryOrder === "object" ? L.entryOrder : {});
         }
         if (s.rangeDisplayMode) setRangeDisplayMode(s.rangeDisplayMode);
+        setRangeOpacity(typeof s.rangeStyle?.opacity === "number" ? s.rangeStyle.opacity : 0.33);
+        setRangeExtend(typeof s.rangeStyle?.extend === "number" ? s.rangeStyle.extend : 0);
+        setRangeRound(typeof s.rangeStyle?.round === "number" ? s.rangeStyle.round : 0);
         if (s.rangeColorTrackKey !== undefined) setRangeColorTrackKey(s.rangeColorTrackKey);
         if (s.search) {
           const q = s.search;
@@ -4361,6 +4368,7 @@ export default function Phylo() {
           if (o.barFill !== undefined) setOptBarFill(o.barFill);
           if (o.pctIncludeUnlabelled !== undefined) setOptPctIncludeUnlabelled(o.pctIncludeUnlabelled);
           if (o.background) setOptBackground(o.background);
+          setOptBranchColor(typeof o.branchColor === "string" ? o.branchColor : "#333333");
           if (o.taperBranches !== undefined) setOptTaperBranches(o.taperBranches);
           if (o.exportScale !== undefined) setExportScale(o.exportScale);
         }
@@ -5014,6 +5022,53 @@ export default function Phylo() {
                 </button>
               ))}
             </div>
+            {rangeDisplayMode === "background" && (
+              <div className="style-panel" style={{ gap: 4, marginBottom: 8 }}>
+                {([
+                  ["Opacity", rangeOpacity, setRangeOpacity, 0.05, 1, 0.05, (v: number) => `${Math.round(v * 100)}%`],
+                  ["Extend", rangeExtend, setRangeExtend, 0, 60, 1, (v: number) => `${v} px`],
+                  ["Round corners", rangeRound, setRangeRound, 0, 60, 1, (v: number) => `${v} px`],
+                ] as const).map(([label, val, set, min, max, step, fmt]) => (
+                  <div key={label} className="style-row" title={label === "Extend" ? "Grow each shaded area past its edge" : label === "Round corners" ? "Smooth the corners of each shaded area" : undefined}>
+                    <span className="note">{label}</span>
+                    <input type="range" min={min} max={max} step={step} value={val}
+                      onChange={(e) => (set as (v: number) => void)(Number(e.target.value))} style={{ flex: 1, minWidth: 0 }} />
+                    <span className="note" style={{ minWidth: 40, textAlign: "right" }}>{fmt(val)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {columnRings.some(t => t.type === "categorical") && (
+              <div style={{ marginBottom: 8 }}>
+                <div className="note" style={{ fontWeight: 600 }}>From a column</div>
+                <div className="note" style={{ marginBottom: 4 }}>Every largest clade whose leaves share one value; a value split over several places gives one clade per piece.</div>
+                <div className="style-row">
+                  <select value={cladeCol ?? ""} onChange={(e) => setCladeCol(e.target.value || null)} style={{ fontSize: 12, flex: 1, minWidth: 0 }}>
+                    <option value="">Column…</option>
+                    {columnRings.filter(t => t.type === "categorical").map(t => <option key={t.key} value={t.key}>{t.label || t.key}</option>)}
+                  </select>
+                  <span className="note" title="Skip values with fewer leaves than this in total">min</span>
+                  <IntField value={cladeMin} min={2} max={100000} onChange={setCladeMin} style={{ width: 52, fontSize: 12 }} />
+                </div>
+                {cladesFromColumn && (<>
+                  <div className="style-row" style={{ marginTop: 4 }}>
+                    <span className="note">{cladesFromColumn.clades.length} clades</span>
+                    <button type="button" className="btn" disabled={!cladesFromColumn.clades.length} title="Add a coloured range (category colour + name) for each clade"
+                      onClick={() => {
+                        const cmap = cladeCol ? colorMaps.get(cladeCol) : undefined;
+                        setRanges(prev => [...prev, ...cladesFromColumn.clades.map(c => ({ nodeId: c.nodeId, color: cmap?.get(c.value) ?? "#ffe08a", label: c.value }))]);
+                      }}>Add ranges</button>
+                    <button type="button" className="btn" disabled={!cladesFromColumn.clades.length} title="Collapse each clade (each piece of a split value separately)"
+                      onClick={() => setCollapsedNodes(prev => { const n = new Set(prev); for (const c of cladesFromColumn.clades) n.add(c.nodeId); return n; })}>Collapse</button>
+                  </div>
+                  {cladesFromColumn.splitAcrossRoot.length > 0 && (
+                    <div className="note" style={{ marginTop: 2 }}>
+                      Split across the root: {cladesFromColumn.splitAcrossRoot.slice(0, 6).join(", ")}{cladesFromColumn.splitAcrossRoot.length > 6 ? "…" : ""}. <b>Re-root at midpoint</b> (Layout &amp; View) may join their pieces.
+                    </div>
+                  )}
+                </>)}
+              </div>
+            )}
             {ranges.length === 0 ? (
               <div className="note">No ranges yet. Select a node and press <kbd>C</kbd>.</div>
             ) : (<>
@@ -5839,32 +5894,7 @@ export default function Phylo() {
                   <input type="checkbox" checked={decor.connArrows} onChange={(e) => patchDecor({ connArrows: e.target.checked })} /> Arrowheads at the target
                 </label>
               </>)}
-              <div className="note decor-heading">Clades from a column</div>
-              <div className="note" style={{ marginBottom: 4 }}>Find the largest clades whose leaves all share one value.</div>
-              <div className="style-row">
-                <select value={cladeCol ?? ""} onChange={(e) => setCladeCol(e.target.value || null)} style={{ fontSize: 11, flex: 1, minWidth: 0 }}>
-                  <option value="">Column…</option>
-                  {columnRings.filter(t => t.type === "categorical").map(t => <option key={t.key} value={t.key}>{t.label}</option>)}
-                </select>
-                <span className="note">min</span>
-                <IntField value={cladeMin} min={2} max={100000} onChange={setCladeMin} style={{ width: 52, fontSize: 11 }} />
-              </div>
-              {cladeCol && (() => {
-                const clades = uniformCladeList;
-                return (
-                  <div className="style-row" style={{ flexWrap: "wrap" }}>
-                    <span className="note">{clades.length} clades</span>
-                    <button type="button" className="btn" disabled={!clades.length} title="Add a coloured range (category colour + label) for each clade"
-                      onClick={() => {
-                        const cmap = colorMaps.get(cladeCol);
-                        setRanges(prev => [...prev, ...clades.map(c => ({ nodeId: c.nodeId, color: cmap?.get(c.value) ?? "#ffe08a", label: c.value }))]);
-                      }}>Add ranges</button>
-                    <button type="button" className="btn" disabled={!clades.length} title="Collapse each clade into a triangle"
-                      onClick={() => setCollapsedNodes(prev => { const n = new Set(prev); for (const c of clades) n.add(c.nodeId); return n; })}>Collapse</button>
-                  </div>
-                );
-              })()}
-
+              <div className="note" style={{ marginTop: 6 }}>To colour or collapse every clade of a column, use <b>Coloured Ranges → From a column</b>.</div>
               <div style={{ marginTop: 6 }}>
                 <button type="button" className="btn" onClick={() => setDecor(DEFAULT_DECOR)}>Reset decorations</button>
               </div>
@@ -5895,6 +5925,11 @@ export default function Phylo() {
                 onChange={(e) => setOptTaperBranches(e.target.checked)} />
               Taper branches
             </label>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 12 }} title="Used where no coloured range or support colour applies">Branch colour</span>
+              <input type="color" value={optBranchColor} onChange={(e) => setOptBranchColor(e.target.value)}
+                style={{ width: 44, height: 26, padding: 1, border: "1px solid #ccc", borderRadius: 4, cursor: "pointer" }} />
+            </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
               <span style={{ fontSize: 12 }}>Background colour</span>
               <input type="color" value={optBackground} onChange={(e) => setOptBackground(e.target.value)}
