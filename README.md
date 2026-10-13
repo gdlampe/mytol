@@ -33,6 +33,8 @@ Added in this fork (`updates` branch):
 - **Sessions**: save/load everything (data, view, filters, selection, legend, styles) as one JSON file
 - **Several support values per node** (IQ-TREE `SH-aLRT/aBayes/UFBoot`): pick which one colours and labels branches
 - **Resizable side panel**: drag its right edge
+- **Coloured ranges**: opacity, extend past the edge and rounded corners; colour or collapse every clade of a column at once (split groups give one clade per piece); one clean shape per range in the SVG
+- **Branch colour** option
 
 ---
 
