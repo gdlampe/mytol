@@ -18,10 +18,20 @@ export type MarkerRule = {
   shape: ShapeKind;
   shapeByValue: boolean;
   shapes: Record<string, ShapeKind>;
+  /** Column holding each leaf's shape (names or iTOL codes 1–6); overrides the above where readable. */
+  shapeColumn?: string | null;
   /** Fixed colour, or null = the column's colours (category colours / numeric ring gradient). */
   color: string | null;
+  /** Column holding each leaf's colour (hex values, or that column's category colours); overrides `color`. */
+  colorColumn?: string | null;
   size: number;
   filled: boolean;
+  /** Outline: on / colour / width (px). */
+  border?: boolean;
+  borderColor?: string;
+  borderWidth?: number;
+  /** Draw every marker (no thinning of overlapping ones on screen; the SVG export always draws all). */
+  drawAll?: boolean;
   /** Legend title (blank = the column name). */
   label: string;
   visible: boolean;
@@ -30,8 +40,9 @@ export type MarkerRule = {
 export const newMarkerRule = (column: string | null): MarkerRule => ({
   id: `m${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`,
   column, op: "any", values: [], a: null, b: null,
-  shape: "circle", shapeByValue: false, shapes: {}, color: null,
-  size: 8, filled: true, label: "", visible: true,
+  shape: "circle", shapeByValue: false, shapes: {}, shapeColumn: null, color: null, colorColumn: null,
+  size: 8, filled: true, border: true, borderColor: "#333333", borderWidth: 0.6, drawAll: false,
+  label: "", visible: true,
 });
 
 /** Does a row satisfy a marker rule? */

@@ -176,6 +176,8 @@ const rangeEntryId = (label: string, color: string) => `ranges\x00${label}\x00${
 
 /** Longest category list drawn per legend section (the rest collapse to "… N more"). */
 const LEGEND_MAX_ENTRIES = 100;
+/** Leaf-marker rules with more matches than this thin overlapping markers on screen (not in SVG). */
+const MARKER_THIN_ABOVE = 2000;
 /** Longest item list shown per section in the Legend panel. */
 const LEGEND_PANEL_MAX_ITEMS = 300;
 
@@ -735,7 +737,9 @@ export default function Phylo() {
         // Mostly-unique text (sequences, domain strings, value lists, free text)
         // makes a useless colour strip: start hidden; use it in a multi-column ring instead.
         const idLike = meta.cats.size > 100 && meta.cats.size > 0.3 * meta.filled;
-        return { key: col, label: col, type: "categorical" as const, height: 8, visible: !idLike };
+        // A column of shape names (for Leaf markers' "shape from") is no use as a strip either.
+        const shapeLike = meta.cats.size > 0 && [...meta.cats].every(c => parseShape(c) !== null && !/^\d+$/.test(c.trim()));
+        return { key: col, label: col, type: "categorical" as const, height: 8, visible: !idLike && !shapeLike };
       });
     });
 
@@ -1131,7 +1135,12 @@ export default function Phylo() {
     return out;
   }, [tree, annotations, internalRows, decor.markers]);
   /** Marker shape for a value: the rule's shape, or per value (rule → colour key → a default cycle). */
-  const markerShape = (rule: MarkerRule, value: string): ShapeKind => {
+  const markerShape = (rule: MarkerRule, value: string, row?: AnnotationRow): ShapeKind => {
+    if (rule.shapeColumn) {
+      const raw = row?.[rule.shapeColumn];
+      const sh = parseShape(raw === null || raw === undefined ? "" : String(raw));
+      if (sh) return sh;
+    }
     if (!rule.shapeByValue) return rule.shape;
     const given = rule.shapes[value] ?? (rule.column ? colorKeyShapes.get(rule.column)?.get(value) : undefined);
     if (given) return given;
@@ -1140,9 +1149,19 @@ export default function Phylo() {
     return DEFAULT_SHAPES[i % DEFAULT_SHAPES.length];
   };
   const markerColor = (rule: MarkerRule): ((row: AnnotationRow | undefined) => string) => {
+    if (rule.colorColumn) {
+      const fn = columnColorFn(rule.colorColumn);
+      return (row) => fn?.(row) ?? rule.color ?? "#333333";
+    }
     if (rule.color) return () => rule.color!;
     const fn = rule.column ? columnColorFn(rule.column) : null;
     return (row) => fn?.(row) ?? "#333333";
+  };
+  /** The first matching row for each value (legend / editor swatches with shape or colour columns). */
+  const markerFirstRows = (rule: MarkerRule): Map<string, AnnotationRow | undefined> => {
+    const m = new Map<string, AnnotationRow | undefined>();
+    for (const h of markerHits.get(rule.id) ?? []) if (!m.has(h.value)) m.set(h.value, nodeRow(h.id));
+    return m;
   };
   /** Values a rule's leaves carry, in category order (legend, per-value shape list). */
   const markerValues = (rule: MarkerRule): string[] => {
@@ -1356,11 +1375,12 @@ export default function Phylo() {
           stops: cs.stops.map(color => ({ color, opacity: 1 })), ticks: scaleTicks(sc) });
         continue;
       }
-      const byValue = rule.column && (rule.shapeByValue || !rule.color);
-      const cmap = rule.column ? colorMaps.get(rule.column) : undefined;
+      const byValue = rule.column && (rule.shapeByValue || !rule.color || rule.shapeColumn || rule.colorColumn);
+      const firstRows = markerFirstRows(rule);
+      const colorOf = markerColor(rule);
       const entries: LegendEntry[] = byValue
-        ? markerValues(rule).map(v => ({ id: `${sid}\x00${v}`, label: text(`${sid}\x00${v}`, v), color: rule.color ?? cmap?.get(v) ?? "#333333",
-            fillAlpha: 1, shape: markerShape(rule, v), hollow: !rule.filled }))
+        ? markerValues(rule).map(v => ({ id: `${sid}\x00${v}`, label: text(`${sid}\x00${v}`, v), color: colorOf(firstRows.get(v)),
+            fillAlpha: 1, shape: markerShape(rule, v, firstRows.get(v)), hollow: !rule.filled }))
         : [{ id: `${sid}\x00all`, label: text(`${sid}\x00all`, rule.label || (rule.column ? colLabel(rule.column) : "Marked leaves")),
             color: rule.color ?? "#333333", fillAlpha: 1, shape: rule.shape, hollow: !rule.filled }];
       sections.push({ id: sid, title, kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder[sid]), more: 0 });
@@ -1538,7 +1558,9 @@ export default function Phylo() {
     W: number, H: number, center: [number, number], mode: "rect" | "radial",
     leafFrom: number, leafTo: number,
     /** Approximate screen distance between neighbouring leaves (for level of detail). */
-    leafPx: number
+    leafPx: number,
+    /** SVG export: draw every marker (no thinning). */
+    exporting = false
   ) {
     if (!tree) return;
     const onScreen = (p: [number, number], m: number) => p[0] >= -m && p[0] <= W + m && p[1] >= -m && p[1] <= H + m;
@@ -1654,6 +1676,8 @@ export default function Phylo() {
       markerOffset += size + 2;
       if (!hits.length) continue;
       const colorOf = markerColor(rule);
+      // Overlapping markers are thinned on screen only for big rules, unless "Draw all".
+      const thin = !exporting && !rule.drawAll && hits.length > MARKER_THIN_ABOVE;
       const cell = Math.max(2, size * 0.9);
       const seen = new Set<number>();
       for (const h of hits) {
@@ -1670,12 +1694,18 @@ export default function Phylo() {
         }
         const q: [number, number] = [p[0] + dir[0] * o, p[1] + dir[1] * o];
         if (!onScreen(q, size)) continue;
-        const key = Math.floor(q[0] / cell) * 100003 + Math.floor(q[1] / cell);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const color = colorOf(nodeRow(h.id));
-        out.shape(markerShape(rule, h.value), q[1], q[0], size, rule.filled ? color : null,
-          rule.filled ? "rgba(0,0,0,0.45)" : color, rule.filled ? 0.5 : 1.5);
+        if (thin) {
+          const key = Math.floor(q[0] / cell) * 100003 + Math.floor(q[1] / cell);
+          if (seen.has(key)) continue;
+          seen.add(key);
+        }
+        const row = nodeRow(h.id);
+        const color = colorOf(row);
+        const border = rule.border ?? true;
+        out.shape(markerShape(rule, h.value, row), q[1], q[0], size,
+          rule.filled ? color : null,
+          rule.filled ? (border ? rule.borderColor ?? "#333333" : null) : color,
+          rule.filled ? (rule.borderWidth ?? 0.6) : Math.max(1, rule.borderWidth ?? 1.5));
       }
       out.flush();
     }
@@ -4236,7 +4266,7 @@ export default function Phylo() {
           : cp ? `M ${f(p[0])},${f(p[1])} Q ${f(cp[0])},${f(cp[1])} ${f(q[0])},${f(q[1])}`
           : `M ${f(p[0])},${f(p[1])} L ${f(q[0])},${f(q[1])}`;
         lines.push(`<path fill="none" stroke="${color}" stroke-width="${f(width)}" stroke-opacity="${alpha}"${dashed ? ' stroke-dasharray="8,6"' : ""} d="${d}"/>`);
-      }, nodeScreen, W, H, [cx, cy], layout === "rect" ? "rect" : "radial", from, to, leafPx);
+      }, nodeScreen, W, H, [cx, cy], layout === "rect" ? "rect" : "radial", from, to, leafPx, true);
       out.flush();
       lines.push('</g>');
     }
@@ -5952,8 +5982,8 @@ export default function Phylo() {
                   columns={columnChoices}
                   categories={rule.column ? [...(colorMaps.get(rule.column)?.keys() ?? [])] : []}
                   shownValues={markerValues(rule)}
-                  shapeOf={(v) => markerShape(rule, v)}
-                  colorOf={(v) => rule.color ?? (rule.column ? colorMaps.get(rule.column)?.get(v) : undefined) ?? "#333333"}
+                  shapeOf={(v) => markerShape(rule, v, markerFirstRows(rule).get(v))}
+                  colorOf={(v) => (rule.colorColumn ? markerColor(rule)(markerFirstRows(rule).get(v)) : rule.color ?? (rule.column ? colorMaps.get(rule.column)?.get(v) : undefined) ?? "#333333")}
                   matches={markerHits.get(rule.id)?.length ?? 0}
                   onChange={(patch) => patchDecor({ markers: decor.markers.map(r => (r.id === rule.id ? { ...r, ...patch } : r)) })}
                   onRemove={() => patchDecor({ markers: decor.markers.filter(r => r.id !== rule.id) })}

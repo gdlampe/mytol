@@ -9,7 +9,7 @@ files have an `id` column of leaf names, then one column per annotation (no iTOL
 1. **Load → Load example data** first (tree + `RTtreelabels.csv`): it clears any loaded annotation files.
 2. **Load → Annotations (CSV/TSV) → Add files…**: select every `.tsv` here, `colors.tsv` included. Each shows
    as a chip (`⇄ connections.tsv`; a colour-key chip for `colors.tsv`). Dropping them on the tree works too.
-3. **Layout & View → Circ**, then zoom out (**–**) until the rings fit. About 45 columns also get a plain ring (bars,
+3. **Layout & View → Circ**, then zoom out (**–**) until the rings fit. About 47 columns also get a plain ring (bars,
    gradients or colour strips; long text starts hidden): untick unneeded ones in **Annotation Tracks** (click its header).
 4. Per ring file below: **Annotation Tracks → + Add ring…** (under the list) → **Type** → tick the column(s) →
    **Add ring**: its options open under the new ring's row (**Style ▾ / ▴** shows or hides them).
@@ -29,10 +29,12 @@ files have an `id` column of leaf names, then one column per annotation (no iTOL
 | Aligned sequence | One string per leaf, all the same length; gaps `-`, `.` or `~`. |
 | Colour | `#rgb` / `#rrggbb` work everywhere. A category value that is itself a colour (`#e15759`) is drawn in that colour. Domain cells also take `rgb()`, `hsl()` and basic names (`darkgreen`); connections any CSS colour. |
 | Label style | A cell containing `bold` and / or `italic`. |
+| Shape | `circle` `square` `star` `triangle` (`-up` `-down` `-left` `-right`) `diamond` `hexagon` `octagon` `plus` `cross` `check`, or iTOL codes `1`–`6` (1 square, 2 circle, 3 star, 4 triangle →, 5 triangle ←, 6 check). A column of shape names starts hidden as a ring. |
 
 ## Colour keys (colors.tsv)
-A colour key has `column`, `value` and `color` (or `colour`) columns and no `id` or `name` column. Load it with
-**Add files…**; it shows as a chip under **Annotations (CSV/TSV)**. Three kinds of rows:
+A colour key has `column`, `value` and `color` (or `colour`) columns and no `id` or `name` column; an optional `shape`
+column gives a value's leaf-marker shape. Load it with **Add files…**; it shows as a chip under **Annotations (CSV/TSV)**.
+Three kinds of rows:
 ```
 column             value      color
 subfamily          nonLTR-02  #1f77b4
@@ -205,6 +207,23 @@ C5K8E4|Q54DH4  non-LTR       2                                                  
    colour on a yellow highlight.
 - Colours come from `colors.tsv`; a hex colour written in a cell (`#1f77b4`) is drawn as itself.
 - Clade rows colour the whole clade; label settings use leaf rows only. **Reset decorations** clears all.
+
+## markers.tsv
+Leaf markers: symbols at the leaf tips, by rules (iTOL's symbol datasets). 73 leaves spread over the tree.
+```
+id          assay_result  structure  marker_shape
+A0A6U3JU95  active                   circle
+A0A131Y5R5  inactive      solved     circle
+A0A1X6NS11  inactive                 square
+```
+1. **Tree decorations → Leaf markers → + Add marker rule**: column `assay_result` (**has a value**), tick **per
+   value** and **column colours**, size `12`. `colors.tsv` gives each result a colour and a shape (`shape` column).
+2. **+ Add marker rule**: column `structure` **is** `solved`, shape **Star**, untick **column colours** and pick a
+   colour, size `14`. It sits further out from the tip; **▲ ▼** reorder rules.
+3. A third rule on `assay_result` with **shape from** `marker_shape` takes each leaf's shape from that column
+   (circle = bacterial, square = eukaryote); **colour from** works the same way with colour values or categories.
+- **border**: outline colour and width. Rules with over 2,000 matches thin overlapping markers on screen; tick
+  **draw all** to draw every one. The SVG export always draws all. Each rule gets a legend section.
 
 ## connections.tsv
 Curves between leaves or clades (`A|B`, or iTOL's `A---B`), each with its own colour, width and style.

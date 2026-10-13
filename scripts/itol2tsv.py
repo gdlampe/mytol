@@ -1414,6 +1414,11 @@ def conv_symbol(d: Dataset) -> None:
     for i, (slot, n) in enumerate(slots):
         want = d.label if i == 0 else f"{d.label} ({slot}{'' if n == 1 else f' {n}'})"
         keys[(slot, n)] = d.add(f"s{i}", want, "category", policy="keep")
+    # A shape column (mitol shape names) for slots whose symbols use several shapes: Leaf markers → shape from.
+    hkeys = {}
+    for i, s in enumerate(slots):
+        if len({e[2] for e in entries if e[1] == s}) > 1:
+            hkeys[s] = d.add(f"h{i}", f"{d.col(keys[s]).want} shape", "category", policy="keep")
     zkeys = {}  # a size column for slots whose symbol sizes vary
     for i, s in enumerate(slots):
         if len({e[3] for e in entries if e[1] == s}) > 1:
@@ -1422,6 +1427,8 @@ def conv_symbol(d: Dataset) -> None:
     shapes_by_value: Dict[str, Counter] = {}
     for rid, slot, shape, size, c, fill, value in entries:
         d.put(rid, keys[slot], value)
+        if slot in hkeys and shape in MITOL_SHAPES:
+            d.put(rid, hkeys[slot], MITOL_SHAPES[shape])
         pairs[keys[slot]].append((value, c))
         shapes_by_value.setdefault(value, Counter())[shape] += 1
         if slot in zkeys:
@@ -1448,7 +1455,8 @@ def conv_symbol(d: Dataset) -> None:
     filled = "untick filled" if fills and set(fills) == {"0"} else "filled"
     d.feature = "Leaf markers (decoration)"
     if len(shape_count) > 1:
-        shape_txt = "tick per value (shapes from colors.tsv)"
+        shape_txt = ("shape from [[h0]] (or tick per value: shapes from colors.tsv)" if hkeys
+                     else "tick per value (shapes from colors.tsv)")
     else:
         shape_txt = f"shape {ITOL_SHAPES.get(main_shape, 'Circle')}"
     d.steps.append(f"Tree decorations → Leaf markers → + Add marker rule → column [[s0]] (has a value); {shape_txt}, "

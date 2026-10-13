@@ -112,6 +112,20 @@ export default function MarkerRuleEditor({ rule, index, count, columns, categori
         )}
       </div>
       <div className="style-row">
+        <span className="note" title="A column holding each leaf's shape: circle, square, star, triangle, diamond… or iTOL codes 1–6">shape from</span>
+        <select value={rule.shapeColumn ?? ""} onChange={(e) => onChange({ shapeColumn: e.target.value || null })} style={{ fontSize: 11, flex: 1, minWidth: 0 }}>
+          <option value="">— none —</option>
+          {columns.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+        </select>
+      </div>
+      <div className="style-row">
+        <span className="note" title="A column holding each leaf's colour (hex values), or whose category colours to use">colour from</span>
+        <select value={rule.colorColumn ?? ""} onChange={(e) => onChange({ colorColumn: e.target.value || null })} style={{ fontSize: 11, flex: 1, minWidth: 0 }}>
+          <option value="">— none —</option>
+          {columns.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+        </select>
+      </div>
+      <div className="style-row">
         <span className="note">size</span>
         <input type="range" min={3} max={30} step={1} value={rule.size} onChange={(e) => onChange({ size: Number(e.target.value) })} style={{ flex: 1, minWidth: 0 }} />
         <span className="note" style={{ minWidth: 30 }}>{rule.size} px</span>
@@ -119,6 +133,22 @@ export default function MarkerRuleEditor({ rule, index, count, columns, categori
           <input type="checkbox" checked={rule.filled} onChange={(e) => onChange({ filled: e.target.checked })} /> filled
         </label>
       </div>
+      <div className="style-row">
+        <label className="note" style={{ display: "flex", alignItems: "center", gap: 3 }} title="Outline round each filled marker">
+          <input type="checkbox" checked={rule.border ?? true} onChange={(e) => onChange({ border: e.target.checked })} /> border
+        </label>
+        {(rule.border ?? true) && (<>
+          <Swatch color={rule.borderColor ?? "#333333"} title="Border colour"
+            onClick={() => editColor("Marker border", rule.borderColor ?? "#333333", (c) => onChange({ borderColor: c }))} />
+          <input type="range" min={0.2} max={4} step={0.1} value={rule.borderWidth ?? 0.6}
+            onChange={(e) => onChange({ borderWidth: Number(e.target.value) })} style={{ flex: 1, minWidth: 0 }} />
+          <span className="note" style={{ minWidth: 34 }}>{(rule.borderWidth ?? 0.6).toFixed(1)} px</span>
+        </>)}
+      </div>
+      <label className="note" style={{ display: "flex", alignItems: "center", gap: 3 }}
+        title="Draw every marker even where they overlap. Rules with more than 2,000 matches otherwise thin overlapping markers on screen; the SVG export always draws all.">
+        <input type="checkbox" checked={!!rule.drawAll} onChange={(e) => onChange({ drawAll: e.target.checked })} /> draw all (no thinning)
+      </label>
 
       {rule.shapeByValue && shownValues.length > 0 && (
         <div className="ann-value-list" style={{ maxHeight: 130 }}>

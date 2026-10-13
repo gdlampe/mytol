@@ -1,4 +1,4 @@
-column	value	color
+column	value	color	shape
 clade	non-LTR retrotransposons	#1f77b4
 clade	LTR retrotransposons	#2ca02c
 clade	Group II introns	#d62728
@@ -213,3 +213,6 @@ ca_vs_mg_log2	(high)	#e66101
 zn_vs_mg_log2	(low)	#5e3c99
 zn_vs_mg_log2	(mid)	#f7f7f7
 zn_vs_mg_log2	(high)	#e66101
+assay_result	active	#2ca02c	circle
+assay_result	partial	#ff7f0e	triangle-up
+assay_result	inactive	#7f7f7f	square
