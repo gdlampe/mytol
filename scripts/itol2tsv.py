@@ -11,7 +11,8 @@ Usage:
   python3 scripts/itol2tsv.py INPUT [INPUT ...] [-o OUTDIR] [--tree TREE.nwk] [--recursive]
 
   INPUT       iTOL files or folders of them. Files that are not iTOL datasets
-              (plain TSVs, FASTA, ...) are skipped with a one-line note.
+              (plain TSVs, FASTA, ...) are skipped with a one-line note, and so
+              are the files this script wrote itself.
   -o OUTDIR   default: INPUT/mitol_converted for a folder, else a
               mitol_converted folder next to the first input file. Nothing is
               written outside it, and nothing at all when no iTOL dataset is
@@ -19,10 +20,13 @@ Usage:
   --tree      Newick tree: ids missing from the tree are reported, and clade
               references in per-leaf datasets ("A|B" = last common ancestor of
               A and B, an internal node name, or iTOL's CONTAINS==<regexp>)
-              become one row per leaf below that node (more specific rows win).
+              become one row per leaf below that node; a leaf takes the whole
+              row of the smallest node that names it (its own row first).
               Decoration columns (branch colours / widths, node symbols, node
               pies) keep clade rows, written with one spelling per clade so
-              mitol merges them.
+              mitol merges them; iTOL clade-wide branch widths go on every
+              branch of the clade, and a clade colour is split around leaves
+              that have their own branch colour.
   --recursive also read sub-folders of folder inputs.
 
 Outputs (in OUTDIR):
@@ -30,11 +34,13 @@ Outputs (in OUTDIR):
                           (column names from DATASET_LABEL / FIELD_LABELS,
                           unique across the run and the tables in OUTDIR)
   <stem>.connections.tsv  DATASET_CONNECTION: source, target, width, color, style, label
-  colors.tsv              colour key: column, value, color (value = a category,
+  colors.tsv              colour key: column, value, color, shape (value = a category,
                           "(color)" for a numeric column's bar / field colour,
-                          "(low)" / "(mid)" / "(high)" for gradient stops)
+                          "(low)" / "(mid)" / "(high)" for gradient stops; shape =
+                          the iTOL symbol shape, used by mitol's Leaf markers)
   README.md               source → output table and the mitol clicks per file
-  .itol2tsv.json          manifest: the files this script wrote in OUTDIR
+  .itol2tsv.json          manifest: the files this script wrote in OUTDIR (sources
+                          relative to OUTDIR, so a copied folder keeps working)
 
 OUTDIR may be shared with other tools: files the manifest does not list are
 never overwritten. Re-running overwrites this script's own files. Tables made
@@ -44,7 +50,8 @@ tables whose source file is gone, or no longer converts, are removed.
 Supported: DATASET_COLORSTRIP, SIMPLEBAR, GRADIENT, MULTIBAR, HEATMAP,
 EXTERNALSHAPE, PIECHART, BINARY, SYMBOL, DOMAINS, TEXT, CONNECTION, STYLE,
 ALIGNMENT, BOXPLOT, LINECHART, RANGE, TREE_COLORS, LABELS, COLLAPSE, METADATA.
-POPUP_INFO, DATASET_IMAGE and other types are skipped with a note.
+POPUP_INFO, DATASET_IMAGE, AUTO_TAXONOMY and other types, and datasets without
+data rows, are skipped with a note.
 
 Python 3 standard library only.
 """
@@ -52,33 +59,71 @@ Python 3 standard library only.
 from __future__ import annotations
 
 import argparse
-import datetime
 import hashlib
 import json
 import math
 import os
 import re
+import signal
 import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Container, Dict, Iterable, List, Optional, Set, Tuple
 
 # ============================================================
 # Constants
 # ============================================================
 
-ITOL_HEADERS = {"TREE_COLORS", "LABELS", "COLLAPSE", "POPUP_INFO", "METADATA", "MULTI_STYLE", "PRUNE", "SPACING"}
+ITOL_HEADERS = {"TREE_COLORS", "LABELS", "COLLAPSE", "POPUP_INFO", "METADATA", "MULTI_STYLE", "PRUNE", "SPACING",
+                "AUTO_TAXONOMY"}
 SEPARATORS = {"TAB": "\t", "COMMA": ",", "SPACE": " "}
 
-# Setting keys recognised right after the DATA line (before the first data row).
+# Every setting key of the official iTOL templates. Right after the DATA line (before the first data row) a line
+# starting with one of these is a setting, not a data row.
 KNOWN_SETTINGS = {
-    "SEPARATOR", "DATASET_LABEL", "COLOR", "FIELD_LABELS", "FIELD_COLORS", "FIELD_SHAPES", "LEGEND_TITLE",
-    "LEGEND_SHAPES", "LEGEND_COLORS", "LEGEND_LABELS", "LEGEND_SCALE", "LEGEND_POSITION_X", "LEGEND_POSITION_Y",
-    "LEGEND_HORIZONTAL", "LEGEND_SHAPE_SCALES", "COLOR_MIN", "COLOR_MID", "COLOR_MAX", "USE_MID_COLOR", "MARGIN",
-    "STRIP_WIDTH", "WIDTH", "SHOW_INTERNAL", "SHOW_LABELS", "BORDER_WIDTH", "BORDER_COLOR", "MAXIMUM_SIZE",
-    "COLOR_BRANCHES", "DATASET_SCALE", "LOG_SCALE", "HEIGHT_FACTOR",
+    "ALIGN_FIELDS", "ALIGN_TO_LABELS", "ALIGN_TO_TREE", "ALL_LABELS_ROTATION", "ARROW_SIZE", "AUTO_LEGEND",
+    "AUTO_SCALE", "AXIS_X", "AXIS_Y", "BACKBONE_COLOR", "BACKBONE_HEIGHT", "BACKGROUND_COLOR", "BAR_LABEL_COLOR",
+    "BAR_SHIFT", "BAR_ZERO", "BORDER_COLOR", "BORDER_DASHED", "BORDER_WIDTH", "BRACKET_BEHIND_DATASETS",
+    "BRACKET_SHIFT", "BRACKET_SIZE", "BRACKET_STYLE", "CENTER_CURVES", "CHART_SHIFT", "COLOR", "COLORED_DOTS",
+    "COLOR_BRANCHES", "COLOR_FILL", "COLOR_GRAPH", "COLOR_MAX", "COLOR_MID", "COLOR_MIN", "COLOR_NAN",
+    "COLOR_SCHEME", "COLUMN_LABELS", "COLUMN_LABEL_ROTATION", "COLUMN_LABEL_SHIFT_X", "COLUMN_LABEL_SHIFT_Y",
+    "COLUMN_LABEL_SIZE_FACTOR", "COMPLETE_BORDER", "CONNECTION_CURVE", "CONNECTION_MARGIN_LEFT",
+    "CONNECTION_MARGIN_RIGHT", "CONNECTION_TAIL", "CONSENSUS_THRESHOLD", "COVER_DATASETS", "COVER_LABELS",
+    "COVER_TREE", "CURVE_ANGLE", "CUSTOM_COLOR_SCHEME", "DASHED_LINES", "DATASET_LABEL", "DATASET_SCALE",
+    "DATA_NORMALIZATION", "DEFAULT_CONNECTION_COLOR", "DEFAULT_CONNECTION_STYLE", "DEFAULT_CONNECTION_WIDTH",
+    "DEFAULT_DOT_COLOR", "DEFAULT_LINE_COLOR", "DISPLAY_CONSENSUS", "DISPLAY_CONSERVATION", "DISPLAY_VALUES",
+    "DOT_SIZE", "DRAW_ARROWS", "END_POSITION", "END_TANGLEGRAM_TREE", "EXCLUDE_LABELS", "EXTERNAL_LABEL_SHIFT",
+    "FIELD_COLORS", "FIELD_LABELS", "FIELD_SHAPES", "FIELD_TREE", "FIT_LABELS", "GRADIENT_FILL", "GRID_COLOR",
+    "GRID_WIDTH", "HEIGHT_FACTOR", "HIGHLIGHT_DISAGREEMENTS", "HIGHLIGHT_REFERENCES", "HIGHLIGHT_TYPE",
+    "HORIZONTAL_GRID", "IGNORE_GAPS", "IMAGE_ROTATION", "IMAGE_SHIFT_H", "IMAGE_SHIFT_V", "INCLUDE_ONLY",
+    "INVERSE_GAPS", "LABELS_BELOW", "LABELS_ON_TOP", "LABELS_VERTICAL", "LABEL_ALIGN", "LABEL_ALIGN_TO_TREE",
+    "LABEL_AUTO_COLOR", "LABEL_OUTLINE_COLOR", "LABEL_OUTLINE_WIDTH", "LABEL_POSITION", "LABEL_ROTATION",
+    "LABEL_SEPARATOR", "LABEL_SHIFT", "LABEL_SHIFT_X", "LABEL_SHIFT_Y", "LABEL_SIZE_FACTOR", "LEGEND_COLORS",
+    "LEGEND_HORIZONTAL", "LEGEND_LABELS", "LEGEND_POSITION_X", "LEGEND_POSITION_Y", "LEGEND_SCALE", "LEGEND_SHAPES",
+    "LEGEND_SHAPE_INVERT", "LEGEND_SHAPE_SCALES", "LEGEND_TITLE", "LEGEND_VISIBLE", "LINE_COLOR", "LINE_COLORS",
+    "LINE_WIDTH", "LOG_SCALE", "LOOP_SIZE", "MARGIN", "MARK_REFERENCES", "MAXIMUM_LINE_WIDTH", "MAXIMUM_SIZE",
+    "MAXIMUM_SYMBOL_SIZE", "NORMALIZATION_RANGE", "NORMALIZATION_TYPE", "ON_BRANCH", "PARTS_REQUIRED",
+    "POLAR_AREA_DIAGRAM", "POSITION_ABOVE", "RANGE_COVER", "RANGE_LABEL_AUTO_COLOR", "RANGE_LABEL_COLOR",
+    "RANGE_LABEL_POSITION", "RANGE_LABEL_ROTATION", "RANGE_LABEL_SHIFT_X", "RANGE_LABEL_SHIFT_Y", "RANGE_LABEL_SIZE",
+    "RANGE_TYPE", "REFERENCE_BOX_BORDER_COLOR", "REFERENCE_BOX_BORDER_WIDTH", "REFERENCE_BOX_FILL_COLOR",
+    "ROTATE_ALIGNED_LABELS", "ROUND_VALUES", "SCALING_FACTOR", "SEPARATOR", "SHAPE_SPACING", "SHAPE_TYPE",
+    "SHOW_ARROW_LABELS", "SHOW_COLUMN_LABELS", "SHOW_DOMAIN_LABELS", "SHOW_DOTS", "SHOW_INTERNAL", "SHOW_LABELS",
+    "SHOW_LINE", "SHOW_RANGES", "SHOW_RANGE_LABELS", "SHOW_STRIPS", "SHOW_STRIP_LABELS", "SHOW_SYMBOLS",
+    "SHOW_TITLE", "SHOW_TREE", "SHOW_VALUE", "SHOW_VALUES", "SHOW_VALUE_LABELS", "SIDE_STACKED", "SIZE_FACTOR",
+    "START_POSITION", "STRAIGHT_LABELS", "STRIP_BORDER_COLOR", "STRIP_BORDER_WIDTH", "STRIP_LABEL_AUTO_COLOR",
+    "STRIP_LABEL_COLOR", "STRIP_LABEL_OUTLINE", "STRIP_LABEL_POSITION", "STRIP_LABEL_ROTATION", "STRIP_LABEL_SHIFT",
+    "STRIP_LABEL_SIZE_FACTOR", "STRIP_SPACING", "STRIP_WIDTH", "SYMBOL_BORDER_COLOR", "SYMBOL_BORDER_WIDTH",
+    "SYMBOL_SPACING", "TANGLEGRAM_EXTERNAL_MARGIN", "TANGLEGRAM_TREE", "TITLE_COLOR", "TITLE_SHIFT_X",
+    "TITLE_SHIFT_Y", "TITLE_SIZE", "TREE_PAN_H", "TREE_PAN_V", "TREE_SCALE_H", "TREE_SCALE_V", "UNROOTED_SMOOTH",
+    "USER_MAX_VALUE", "USER_MID_VALUE", "USER_MIN_VALUE", "USE_MID_COLOR", "VALUES_SCI_NOTATION", "VALUE_AUTO_COLOR",
+    "VALUE_COLOR", "VALUE_LABEL_ROTATION", "VALUE_LABEL_SHIFT", "VALUE_LABEL_SIZE_FACTOR", "VALUE_ROTATION",
+    "VALUE_SHIFT", "VALUE_SIZE_FACTOR", "VERTICAL_CHART", "VERTICAL_GRID", "VERTICAL_SHIFT", "VERTICAL_SHRINK",
+    "WIDTH",
 }
+# An unknown key of the same shape (CAPITALS_WITH_UNDERSCORES) there is read as a setting too, with a warning,
+# unless it is an id of the tree.
+SETTING_LIKE = re.compile(r"[A-Z]+(?:_[A-Z]+)+")
 
 # Short type names: suffix for clashing column names, and the README.
 SHORT_TYPE = {
@@ -100,6 +145,7 @@ UNSUPPORTED = {
     "MULTI_STYLE": "per-word label styles are not supported by mitol",
     "PRUNE": "pruning lists are not annotations (mitol: select leaves and use Hide)",
     "SPACING": "per-leaf spacing is not supported by mitol",
+    "AUTO_TAXONOMY": "taxonomy assignment files are not annotations (iTOL uses them to look up NCBI / GTDB taxa)",
 }
 
 # Fewest fields (id included) a DATA row needs to give a value; shorter rows are skipped with a warning.
@@ -130,6 +176,8 @@ RESERVED_FILES = {"colors.tsv", "readme.md", MANIFEST}
 
 # iTOL symbol / field shape numbers → mitol shape names (SHAPE_CHOICES labels).
 ITOL_SHAPES = {"1": "Square", "2": "Circle", "3": "Star", "4": "Triangle →", "5": "Triangle ←", "6": "Check mark"}
+# iTOL symbol codes → mitol shape names (colour-key shape column, read by Leaf markers).
+MITOL_SHAPES = {"1": "square", "2": "circle", "3": "star", "4": "triangle-right", "5": "triangle-left", "6": "check"}
 DOMAIN_SHAPES = {"RE", "HH", "HV", "EL", "DI", "TR", "TL", "PL", "PR", "PU", "PD", "OC", "GP"}
 # iTOL COLOR_SCHEME → mitol alignment "Colour scheme" label.
 ALIGNMENT_SCHEMES = {
@@ -157,10 +205,10 @@ def is_number(s: str) -> bool:
 def js_number(s: str) -> Optional[float]:
     """JavaScript's Number(s) when it is finite; None for blank, NaN and ±Infinity (as mitol's readers)."""
     s = (s or "").strip()
-    if not is_number(s):
+    if not s or JS_NUMBER.fullmatch(s) is None:
         return None
     try:
-        v = float(int(s, 0)) if re.match(r"0[xXoObB]", s) else float(s)
+        v = float(int(s, 0)) if s[:2] in ("0x", "0X", "0o", "0O", "0b", "0B") else float(s)
     except ValueError:
         return None
     return v if math.isfinite(v) else None
@@ -212,25 +260,57 @@ def plural(n: int, word: str, many: Optional[str] = None) -> str:
 # Reading iTOL files
 # ============================================================
 
+def utf16_without_bom(data: bytes) -> Optional[str]:
+    """'utf-16-le' / 'utf-16-be' when the start of the file looks like UTF-16 text without a BOM (mostly ASCII:
+    every other byte is zero), else None."""
+    head = data[:400]
+    if len(head) < 8 or b"\x00" not in head:
+        return None
+    even, odd = (part.count(0) / max(1, len(part)) for part in (head[0::2], head[1::2]))
+    if odd > 0.7 and even < 0.05:
+        return "utf-16-le"
+    if even > 0.7 and odd < 0.05:
+        return "utf-16-be"
+    return None
+
+
 def decode(data: bytes) -> Tuple[str, Optional[str]]:
-    """Text of a file and a note when it was not UTF-8 (UTF-16 with a BOM; else Windows-1252 / Latin-1)."""
+    """Text of a file and a note when it was not UTF-8: UTF-16 (with a BOM, or plain ASCII text without one);
+    else UTF-8 line by line, and Windows-1252 (or Latin-1) only for the lines that are not UTF-8."""
     if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return data.decode("utf-16", errors="replace"), "UTF-16 file: read as UTF-16 (iTOL expects UTF-8)"
+    enc16 = utf16_without_bom(data)
+    if enc16:
+        return data.decode(enc16, errors="replace"), "UTF-16 file without a BOM: read as UTF-16 (iTOL expects UTF-8)"
     if data.startswith(b"\xef\xbb\xbf"):
         data = data[3:]
     try:
         return data.decode("utf-8"), None
     except UnicodeDecodeError:
         pass
-    try:
-        return data.decode("cp1252"), "not UTF-8: read as Windows-1252; check accented characters"
-    except UnicodeDecodeError:
-        return data.decode("latin-1"), "not UTF-8: read as Latin-1; check accented characters"
+    lines, bad = [], []
+    for i, raw in enumerate(data.split(b"\n"), start=1):
+        try:
+            lines.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            bad.append(i)
+            try:
+                lines.append(raw.decode("cp1252"))
+            except UnicodeDecodeError:
+                lines.append(raw.decode("latin-1"))
+    where = ", ".join(str(i) for i in bad[:5]) + (" …" if len(bad) > 5 else "")
+    return "\n".join(lines), (f"{plural(len(bad), 'line')} not UTF-8 (line {where}): read as Windows-1252 / Latin-1; "
+                              "check the accented characters there")
 
 
 def read_text(path: str) -> Tuple[str, Optional[str]]:
     with open(path, "rb") as fh:
         return decode(fh.read())
+
+
+def text_lines(text: str) -> List[str]:
+    """Lines split on \\n, \\r\\n or \\r only (str.splitlines would also split on U+2028, \\x0c, \\x1e …)."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
 
 @dataclass
@@ -279,23 +359,26 @@ class ItolFile:
 
 
 def itol_header(path: str) -> Tuple[Optional[str], str]:
-    """(iTOL keyword, first meaningful line) — keyword None when the file is not an iTOL file."""
+    """(iTOL keyword, first meaningful line); when the file is not an iTOL file: (None, why it is skipped)."""
     try:
         with open(path, "rb") as fh:
             head = fh.read(65536)
     except OSError as e:
-        return None, f"unreadable: {e.strerror}"
-    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        text = head.decode("utf-16", errors="replace")
-    else:
-        text = head.decode("utf-8-sig", errors="replace")
-    for line in text.splitlines():
+        return None, f"cannot read: {e.strerror or e}"
+    enc16 = "utf-16" if head[:2] in (b"\xff\xfe", b"\xfe\xff") else utf16_without_bom(head)
+    text = head.decode(enc16 or "utf-8-sig", errors="replace")
+    for line in text_lines(text):
         s = line.strip()
         if not s or s.startswith("#"):
             continue
         tok = re.split(r"[\t, ]", s, maxsplit=1)[0]
-        return (tok if tok.startswith("DATASET_") or tok in ITOL_HEADERS else None), s
-    return None, "(empty)"
+        if tok.startswith("DATASET_") or tok in ITOL_HEADERS:
+            return tok, s
+        odd = sum(1 for ch in s[:200] if ch == "\ufffd" or (ord(ch) < 32 and ch != "\t"))
+        if "\x00" in text or odd > len(s[:200]) / 10:
+            return None, "binary file, not an iTOL file"
+        return None, f"not an iTOL file (first line: {s[:50]!r})"
+    return None, "empty file" if not head.strip() else "not an iTOL file (only comments)"
 
 
 def split_fields(line: str, sep: str) -> List[str]:
@@ -321,9 +404,10 @@ def parse_setting(line: str, sep: str) -> Optional[Tuple[str, Setting]]:
 SEPARATOR_LINE = re.compile(r"\s*SEPARATOR(?:$|[\t ,]+(\S*))")
 
 
-def read_itol(path: str, kind: str) -> ItolFile:
+def read_itol(path: str, kind: str, ids: Optional[Container[str]] = None) -> ItolFile:
+    """Settings and DATA rows of an iTOL file (ids: the tree's node names, to tell ids from settings)."""
     text, enc_note = read_text(path)
-    lines = text.splitlines()  # handles \n, \r\n and \r
+    lines = text_lines(text)
     f = ItolFile(path, kind)
     if enc_note:
         f.notes.append(enc_note)
@@ -347,6 +431,7 @@ def read_itol(path: str, kind: str) -> ItolFile:
 
     header_seen = in_data = rows_started = False
     stray = 0
+    unknown: List[str] = []
     for ln in lines:
         s = ln.strip()
         if not s or s.startswith("#"):
@@ -368,8 +453,10 @@ def read_itol(path: str, kind: str) -> ItolFile:
             continue
         if not rows_started:  # settings may follow DATA before the first row
             kv = parse_setting(s, f.sep)
-            if kv and kv[0] in KNOWN_SETTINGS:
+            if kv and (kv[0] in KNOWN_SETTINGS or (SETTING_LIKE.fullmatch(kv[0]) and kv[0] not in (ids or ()))):
                 f.settings.setdefault(kv[0], []).append(kv[1])
+                if kv[0] not in KNOWN_SETTINGS:
+                    unknown.append(kv[0])
                 continue
         rows_started = True
         f.lines.append(s)
@@ -378,6 +465,11 @@ def read_itol(path: str, kind: str) -> ItolFile:
         f.notes.append("no DATA line: no data rows read")
     if stray:
         f.notes.append(f"{plural(stray, 'line')} before DATA ignored (not a setting: KEY, separator, values)")
+    if unknown:
+        f.notes.append(f"{plural(len(unknown), 'line')} right after DATA read as "
+                       f"{'a setting, not a data row' if len(unknown) == 1 else 'settings, not data rows'} "
+                       f"({short_list(unknown)}): not an iTOL setting name"
+                       + (", nor an id of the tree" if ids is not None else "; pass --tree if it is a leaf id"))
     if f.lines and kind not in ("DATASET_ALIGNMENT", "COLLAPSE") and not any(f.sep in ln for ln in f.lines):
         other = [n for n, ch in SEPARATORS.items() if n != sep_name and sum(ch in ln for ln in f.lines) >= len(f.lines) / 2]
         if other:
@@ -489,6 +581,15 @@ class Tree:
     def size(self, node: int) -> int:
         return self.R[node] - self.L[node]
 
+    def subtree(self, node: int) -> List[int]:
+        """The node and every node below it."""
+        out, stack = [], [node]
+        while stack:
+            u = stack.pop()
+            out.append(u)
+            stack.extend(self.children[u])
+        return out
+
     def leaf_name(self, pos: int) -> str:
         return self.name[self.leaves[pos]] or ""
 
@@ -578,6 +679,7 @@ class Column:
     policy: str = "specific"  # with --tree: specific / outer = expand clade rows to leaves; keep = leave "A|B" rows
     field_of: Optional[str] = None  # dataset label, for FIELD_LABELS columns
     optional: bool = False  # dropped when empty
+    group: str = "main"   # columns one iTOL row sets together: with --tree a leaf takes all of them from one row
     name: str = ""
 
 
@@ -592,7 +694,9 @@ class Dataset:
         self.label = re.sub(r"\s+", " ", f.text("DATASET_LABEL")).strip()
         self.columns: List[Column] = []
         self.rows: Dict[str, Dict[str, str]] = {}
+        self.claims: Dict[str, Set[str]] = {}  # row id → column groups its iTOL row sets (blank values included)
         self.colors: List[Tuple[str, str, str]] = []  # (column key, value, colour)
+        self.shapes: Dict[Tuple[str, str], str] = {}  # (column key, value) → mitol shape name (symbols)
         self.connections: Optional[List[Dict[str, str]]] = None
         self.pairs: List[Tuple[str, str, str]] = []  # (domains key, length key, stem) named together
         self.feature = ""
@@ -600,15 +704,21 @@ class Dataset:
         self.by_hand: List[str] = []  # settings with a mitol option to set by hand
         self.by_hand_where = "the ring's **Style ▾** options unless said otherwise"
         self.notes: List[str] = []
+        self.renamed: List[str] = []  # column renamed because its name is taken (summary + README)
         self.warnings: List[str] = list(f.notes)
         self.not_carried: List[str] = []
         self.used = {"SEPARATOR", "DATASET_LABEL", "COLOR", "LEGEND_TITLE", "LEGEND_SHAPES", "LEGEND_COLORS", "LEGEND_LABELS"}
         self.out_file = ""
         self.display = f.name  # input name shown in the summary / README (relative to its folder)
+        self.after_tree: List[Callable[[], None]] = []  # converter steps that need the expanded rows (--tree)
+        self.wants: Dict[str, str] = {}  # column key → preferred name, also for columns dropped as empty
+        self._group: Dict[str, str] = {}  # column key → its group
+        self._last_claim: Tuple[str, str] = ("", "")
         self._auto: Dict[str, Tuple[str, str]] = {}  # column key → (ring, colour note): rings mitol adds by itself
         self._bad_numbers: Dict[str, List[str]] = {}
         self._bad_colors: Counter = Counter()
         self._dupes = 0
+        self.unexpanded = False  # clade rows or CONTAINS== patterns left as written (no --tree)
         if not self.label and f.kind.startswith("DATASET_"):
             self.label = f.stem
             self.notes.append(f"no DATASET_LABEL: columns are named after the file ({f.stem})")
@@ -624,8 +734,10 @@ class Dataset:
     # ---------- building ----------
 
     def add(self, key: str, want: str, kind: str, policy: str = "specific", field_of: Optional[str] = None,
-            optional: bool = False) -> str:
-        self.columns.append(Column(key, want, kind, policy, field_of, optional))
+            optional: bool = False, group: str = "main") -> str:
+        self.columns.append(Column(key, want, kind, policy, field_of, optional, group))
+        self.wants[key] = want
+        self._group[key] = group
         return key
 
     def col(self, key: str) -> Column:
@@ -635,9 +747,19 @@ class Dataset:
         """A column mitol shows as a ring by itself; the README step is written in finish()."""
         self._auto[key] = (ring, colours)
 
+    def claim(self, rid: str, key: str) -> None:
+        """Row `rid` sets the group of column `key` (even when its value there is blank or 'X')."""
+        claim = (rid.strip(), self._group.get(key, "main"))
+        if claim != self._last_claim:  # consecutive cells of one row claim the same group
+            self.claims.setdefault(claim[0], set()).add(claim[1])
+            self._last_claim = claim
+
     def put(self, rid: str, key: str, value: str) -> None:
         rid, value = rid.strip(), value.strip()
-        if not rid or value == "":
+        if not rid:
+            return
+        self.claim(rid, key)
+        if value == "":
             return
         row = self.rows.setdefault(rid, {})
         if key in row and row[key] != value:
@@ -645,11 +767,14 @@ class Dataset:
         row[key] = value
 
     def put_number(self, rid: str, key: str, raw: str, blanks: Tuple[str, ...] = ()) -> None:
+        """A number cell; blank, `blanks` (iTOL's 'X') and unreadable values leave the cell empty (the latter
+        counted for a warning). Infinity and overflowing values count as unreadable: mitol reads them as blank."""
         v = raw.strip()
-        if v == "" or v in blanks:
-            return
-        if not is_number(v):
-            self._bad_numbers.setdefault(key, []).append(v)
+        if v == "" or v in blanks or js_number(v) is None:
+            if rid.strip():
+                self.claim(rid, key)
+            if v and v not in blanks:
+                self._bad_numbers.setdefault(key, []).append(v)
             return
         self.put(rid, key, v)
 
@@ -674,7 +799,9 @@ class Dataset:
         for value, cnt in by_value.items():
             self.colors.append((key, value, cnt.most_common(1)[0][0]))
             if len(cnt) > 1:
-                clashes.append(f"'{value}' ({', '.join(f'{c} ×{n}' for c, n in cnt.most_common())})")
+                top = cnt.most_common(3)
+                more = f", +{len(cnt) - 3} more" if len(cnt) > 3 else ""
+                clashes.append(f"'{value}' ({', '.join(f'{c} ×{n}' for c, n in top)}{more})")
         if clashes:
             self.warnings.append(f"[[{key}]]: {plural(len(clashes), 'value')} drawn in several colours, the most "
                                  "common is used: " + "; ".join(clashes[:3]) + (" …" if len(clashes) > 3 else ""))
@@ -769,6 +896,8 @@ class Dataset:
                                  "text files")
         if self.tree is not None:
             self._apply_tree()
+            for step in self.after_tree:
+                step()
         else:
             self._warn_clade_rows()
         present = {k for r in self.rows.values() for k in r}
@@ -776,17 +905,20 @@ class Dataset:
         self.columns = [c for c in self.columns if not (c.optional and c.key not in present)]
         self.steps = [s for s in self.steps if not any(k in s for k in dropped)]  # steps for emptied columns
         for key, bad in self._bad_numbers.items():
-            self.warnings.append(f"[[{key}]]: {plural(len(bad), 'non-numeric value')} left blank ({short_list(sorted(set(bad)))})")
+            self.warnings.append(f"[[{key}]]: {plural(len(bad), 'value')} that {'is' if len(bad) == 1 else 'are'} not "
+                                 f"a finite number left blank ({short_list(sorted(set(bad)))})")
         if self._bad_colors:
             self.warnings.append(f"{plural(sum(self._bad_colors.values()), 'unreadable colour')} ignored "
                                  f"({short_list(sorted(self._bad_colors))})")
         if self._dupes:
             self.warnings.append(f"{plural(self._dupes, 'cell')} given twice for the same id; the last one is used")
         # Colour key rows only for values that are still in the column (clade rows may have been overridden).
-        values: Dict[str, Set[str]] = {}
-        for r in self.rows.values():
-            for k, v in r.items():
-                values.setdefault(k, set()).add(v)
+        keyed = {k for k, v, _ in self.colors if not v.startswith("(")}
+        values: Dict[str, Set[str]] = {k: set() for k in keyed}
+        if keyed:
+            for r in self.rows.values():
+                for k in keyed & r.keys():
+                    values[k].add(r[k])
         self.colors = [(k, v, c) for k, v, c in self.colors if v.startswith("(") or v in values.get(k, ())]
         self._ring_steps()
         for k in self.f.settings:  # settings without a mitol equivalent ("0" = off / none: nothing lost)
@@ -794,13 +926,28 @@ class Dataset:
             if k not in self.used and self.f.get(k).strip() not in ("", "0"):
                 self.not_carried.append(f"{k} {' '.join(vals) if len(vals) > 1 else self.f.get(k)}".strip())
 
+    def unusable(self) -> Optional[str]:
+        """Why nothing can be written for this dataset (None when it has rows and columns)."""
+        if self.connections is not None:
+            if self.connections:
+                return None
+        elif self.rows and self.columns:
+            return None
+        if not self.f.has_data:
+            return "no DATA line"
+        if not self.f.rows and not self.f.lines:
+            return "no data rows"
+        why = [w for w in self.warnings if not w.startswith("no SEPARATOR line")]
+        return "no usable rows" + (f" ({render(self, why[0], quote=chr(39))})" if why else "")
+
     def _ring_steps(self) -> None:
-        """Steps for columns mitol shows as rings by itself, and for category columns made only of numbers."""
+        """Steps for columns mitol shows as rings by itself, and for category or coloured text columns that hold
+        only numbers (mitol reads those as numeric, without category colours)."""
         front = []
         for c in self.columns:
             vals = [r[c.key] for r in self.rows.values() if c.key in r]
-            numeric = c.kind == "category" and bool(vals) and all(is_number(v) for v in vals)
             keyed = any(k == c.key for k, v, _ in self.colors if not v.startswith("("))
+            numeric = (c.kind == "category" or (c.kind == "text" and keyed)) and bool(vals) and all(is_number(v) for v in vals)
             if numeric:
                 self.warnings.append(f"[[{c.key}]]: every value is a number, so mitol reads it as numeric "
                                      "(see the first step for this file)")
@@ -825,6 +972,7 @@ class Dataset:
     def _warn_clade_rows(self) -> None:
         expand = {c.key for c in self.columns if c.policy != "keep"}
         patterns = [rid for rid in self.rows if self.is_pattern(rid)]
+        self.unexpanded = bool(patterns)
         if patterns:
             self.warnings.append(f"{plural(len(patterns), 'CONTAINS== pattern row')} kept as written "
                                  f"({short_list(patterns)}); mitol matches ids exactly: re-run with --tree to apply "
@@ -832,18 +980,29 @@ class Dataset:
         n = sum(1 for rid, r in self.rows.items()
                 if not rid.startswith(CONTAINS) and ("|" in rid or "---" in rid) and expand & set(r))
         if n:
+            self.unexpanded = True
             self.warnings.append(f"{plural(n, 'row id')} with '|' in per-leaf columns: if they are clade references "
                                  "('A|B'), mitol ignores them in rings, label decorations and From a column, so re-run "
                                  "with --tree to expand them to leaves (leaf names that contain '|' are fine)")
 
     def _apply_tree(self) -> None:
+        """Resolve row ids on the tree. Clade rows and CONTAINS== patterns of expanded columns become leaf rows:
+        per leaf and column group, the whole row of the smallest node naming the leaf wins (its own row first;
+        "outer" columns: the largest node); a pattern ranks by the size of the node it matches and loses ties
+        to an explicit row; then the later row wins. Other cells stay with their row (renamed to the leaf when
+        "A|A" names a leaf); patterns fill only what explicit rows left empty there."""
         tree = self.tree
         assert tree is not None
-        expand = {c.key: c.policy for c in self.columns if c.policy != "keep"}
+        expand = {c.key: c for c in self.columns if c.policy != "keep"}
+        groups: Dict[str, List[str]] = {}
+        for c in expand.values():
+            groups.setdefault(c.group, []).append(c.key)
+        outer = {g for g, ks in groups.items() if expand[ks[0]].policy == "outer"}
+        ids = list(dict.fromkeys(list(self.claims) + list(self.rows)))
         targets: Dict[str, List[int]] = {}  # row id → the nodes it applies to
         patterns: List[str] = []
         missing, bad_rx = [], []
-        for rid in self.rows:
+        for rid in ids:
             if self.is_pattern(rid):
                 patterns.append(rid)
                 found = tree.match(rid[len(CONTAINS):])
@@ -864,42 +1023,45 @@ class Dataset:
         if empty:
             self.warnings.append(f"{plural(len(empty), 'CONTAINS== pattern')} {'matches' if len(empty) == 1 else 'match'} "
                                  f"no node of the tree: {short_list(empty)}")
-
-        # Per leaf and expanded column, the winning cell: the smallest node covering the leaf ("specific"; a
-        # leaf's own row has size 1) or the largest ("outer"); CONTAINS== rows rank last; ties go to the later row.
-        weakest = len(tree.leaves) + 1
-        best: Dict[Tuple[int, str], Tuple[int, int, str]] = {}  # (leaf position, key) → (rank, order, value)
+        pset, gset = set(patterns), set(groups)
         clade_rows, big = 0, []
-        for order, (rid, row) in enumerate(self.rows.items()):
-            cells = {k: v for k, v in row.items() if k in expand}
-            if not cells:
+        for rid in ids:
+            if rid not in pset and targets[rid] and not tree.is_leaf(targets[rid][0]) and self.claims.get(rid, set()) & gset:
+                clade_rows += 1
+                if tree.size(targets[rid][0]) > len(tree.leaves) / 2:
+                    big.append(rid)
+        dest_of = {rid: tree.ref(targets[rid][0]) if tree.is_leaf(targets[rid][0]) else rid
+                   for rid in ids if rid not in pset and targets[rid]}
+
+        if not patterns and not clade_rows and len(set(dest_of.values())) == len(dest_of):
+            # Every row names its own leaf (or a node without expanded cells): rename only, no copies.
+            self.rows = {dest_of.get(rid, rid): r for rid, r in self.rows.items() if r}
+            return
+
+        best: Dict[Tuple[int, str], Tuple[Tuple[int, int, int], str]] = {}  # (leaf position, group) → (rank, row id)
+        for order, rid in enumerate(ids):
+            gs = [g for g in self.claims.get(rid, ()) if g in groups]
+            if not gs:
                 continue
-            weak = rid in patterns
+            weak = int(rid in pset)
             for node in targets[rid]:
                 size = tree.size(node)
-                if not weak and not tree.is_leaf(node):
-                    clade_rows += 1
-                    if size > len(tree.leaves) / 2:
-                        big.append(rid)
-                for key, value in cells.items():
-                    rank = weakest if weak else size if expand[key] == "specific" else -size
+                for g in gs:
+                    rank = (-size if g in outer else size, weak, -order)
                     for k in range(tree.L[node], tree.R[node]):
-                        cur = best.get((k, key))
-                        if cur is None or (rank, -order) <= (cur[0], -cur[1]):
-                            best[(k, key)] = (rank, order, value)
+                        cur = best.get((k, g))
+                        if cur is None or rank < cur[0]:
+                            best[(k, g)] = (rank, rid)
 
-        # Rebuild. Other cells stay with their row (renamed to the leaf when "A|A" names a leaf); CONTAINS==
-        # rows fill only what explicit rows left empty; expanded cells go to the winning leaves. Rows keep
-        # their place, leaves that had no row follow in tree order, emptied rows go.
         new_rows: Dict[str, Dict[str, str]] = {}
-        for rid, row in self.rows.items():
-            if rid in patterns:
+        for rid in ids:
+            row = self.rows.get(rid, {})
+            if rid in pset or not row:
                 continue
-            nodes = targets[rid]
-            if not nodes:
+            if not targets[rid]:
                 new_rows.setdefault(rid, {}).update(row)
                 continue
-            dest = new_rows.setdefault(tree.ref(nodes[0]) if tree.is_leaf(nodes[0]) else rid, {})
+            dest = new_rows.setdefault(dest_of[rid], {})
             for k, v in row.items():
                 if k not in expand:
                     if k in dest and dest[k] != v:
@@ -907,28 +1069,33 @@ class Dataset:
                     dest[k] = v
         matched = 0
         for rid in patterns:
-            keep = {k: v for k, v in self.rows[rid].items() if k not in expand}
+            keep = {k: v for k, v in self.rows.get(rid, {}).items() if k not in expand}
             matched += len(targets[rid])
             for node in targets[rid]:
                 dest = new_rows.setdefault(tree.ref(node), {})
                 for k, v in keep.items():
                     dest.setdefault(k, v)
-        for (k, key), (_, _, value) in sorted(best.items()):
-            new_rows.setdefault(tree.leaf_name(k), {})[key] = value
+        for (k, g), (_, rid) in sorted(best.items()):
+            row = self.rows.get(rid, {})
+            cells = {key: row[key] for key in groups[g] if key in row}
+            if cells:
+                new_rows.setdefault(tree.leaf_name(k), {}).update(cells)
         self.rows = {rid: r for rid, r in new_rows.items() if r}
         if clade_rows:
             note = f"{plural(clade_rows, 'clade row')} expanded to the leaves below {'it' if clade_rows == 1 else 'them'} (--tree)"
             if self.kind in SHOWN_WHEN_COLLAPSED:
                 note += ("; iTOL shows a clade's value only while that clade is collapsed (or with SHOW_INTERNAL 1), "
-                         "here it applies to every leaf below it")
+                         "here it applies to every leaf below it that has no row of its own")
             self.notes.append(note + ".")
         if matched:
             self.notes.append(f"{plural(len(patterns) - len(bad_rx) - len(empty), 'CONTAINS== pattern row')} applied "
-                              f"to the {plural(matched, 'matching node')} (leaves and named internal nodes); rows that "
-                              "name a leaf or clade win over them.")
+                              f"to the {plural(matched, 'matching node')} (leaves and named internal nodes). Like other "
+                              "rows, a pattern counts for the node it matches (a leaf it matches by name wins over a "
+                              "clade row above it); on the same node an explicit row wins.")
         if big:
-            self.warnings.append(f"{plural(len(big), 'clade')} cover more than half of the tree ({short_list(big)}); "
-                                 "check the rooting (iTOL and mitol use the tree as rooted in the file)")
+            self.warnings.append(f"{plural(len(big), 'clade')} {'covers' if len(big) == 1 else 'cover'} more than half "
+                                 f"of the tree ({short_list(big)}); check the rooting (iTOL and mitol use the tree as "
+                                 "rooted in the file)")
 
 
 # ============================================================
@@ -959,19 +1126,27 @@ def positive(v: str) -> bool:
 
 
 def conv_colorstrip(d: Dataset) -> None:
-    by_color: Dict[str, str] = {}
+    by_color: Dict[str, List[str]] = {}  # legend colour → its labels
     for _, c, lab in d.legend():
-        if c and lab:
-            by_color.setdefault(c, lab)
+        if c and lab and lab not in by_color.get(c, []):
+            by_color.setdefault(c, []).append(lab)
     k = d.add("strip", d.label, "category")
     pairs = []
+    ambiguous: Counter = Counter()
     for row in d.f.rows:
         c = d.color(row_get(row, 1))
         label = " ".join(row[2:]) if d.f.sep == " " else row_get(row, 2)  # SPACE: the label is the rest
-        value = label or by_color.get(c, "") or c
+        labs = by_color.get(c, [])
+        value = label or " / ".join(labs) or c
+        if not label and len(labs) > 1:
+            ambiguous[value] += 1
         d.put(row[0], k, value)
         pairs.append((value, c))
     d.key_colors(k, pairs)
+    if ambiguous:
+        d.warnings.append(f"{plural(sum(ambiguous.values()), 'row')} without a label {'has' if sum(ambiguous.values()) == 1 else 'have'} "
+                          "a colour that several legend entries use; their value names all of them: "
+                          f"{short_list(sorted(ambiguous))}")
     d.feature = "colour strip ring"
     d.by_hand_where = "Annotation Tracks"
     d.auto_ring(k, "colour strip ring", "colours from colors.tsv")
@@ -1009,10 +1184,10 @@ def conv_gradient(d: Dataset) -> None:
     else:  # iTOL still draws a gradient: keep one (white → COLOR), so mitol does not draw bars
         c = norm_color(d.f.get("COLOR"))
         stops = f"#ffffff → {c}" if c else ""
-        if c:
-            d.colors += [(k, "(low)", "#ffffff"), (k, "(high)", c)]
-            d.notes.append(f"No COLOR_MIN / COLOR_MAX: written as a white → COLOR ({c}) gradient; iTOL's default "
-                           "gradient colours are not documented.")
+        if c:  # only "(high)": mitol starts such a gradient at white by itself
+            d.colors.append((k, "(high)", c))
+            d.notes.append(f"No COLOR_MIN / COLOR_MAX: colors.tsv gives only the high end (COLOR {c}), so mitol draws "
+                           "a white → COLOR gradient; iTOL's default gradient colours are not documented.")
     d.steps.append("Annotation Tracks: [[value]] is added as a ring automatically"
                    + (f"; colors.tsv makes it a colour gradient ({stops})." if stops else
                       "; choose Display: Colour gradient in its Style ▾ options."))
@@ -1045,18 +1220,21 @@ def conv_multibar(d: Dataset) -> None:
 
 def conv_heatmap(d: Dataset) -> None:
     keys = d.field_columns(1, "numeric")
+    x_cells = 0  # iTOL's "no value" cells
     for row in d.f.rows:
         for i, k in enumerate(keys):
-            d.put_number(row[0], k, row_get(row, 1 + i), blanks=("X",))
+            raw = row_get(row, 1 + i)
+            x_cells += raw == "X"
+            d.put_number(row[0], k, raw, blanks=("X",))
     for k in keys:
         d.gradient_colors(k)
     d.feature = "Heatmap ring"
     stops = d.gradient_text()
     d.steps.append(f"Annotation Tracks → + Add ring… → Type: Heatmap → tick {ticks(keys)} → Add ring"
                    + (f" (Colours {stops} from colors.tsv)." if stops else "."))
+    _heatmap_missing(d, x_cells)
     norm = {"rows": "Colour range: Each leaf separately", "columns": "Colour range: Each column separately"}
     d.hints({
-        "COLOR_NAN": lambda v: f"No-value colour: {v}",
         "USER_MIN_VALUE": lambda v: f"Minimum: {v}",
         "USER_MID_VALUE": lambda v: f"Mid value: {v}",
         "USER_MAX_VALUE": lambda v: f"Maximum: {v}",
@@ -1070,6 +1248,35 @@ def conv_heatmap(d: Dataset) -> None:
         "ROUND_VALUES": lambda v: f"Decimals: {v}",
         "VALUE_COLOR": lambda v: f"Value colour: {v}",
     })
+
+
+def _heatmap_missing(d: Dataset, x_cells: int) -> None:
+    """mitol's No-value colour fills every blank cell of a leaf that has a row in any loaded file, iTOL's
+    COLOR_NAN only the 'X' cells: say when to keep or clear it."""
+    d.used.add("COLOR_NAN")
+    nan = d.f.get("COLOR_NAN")
+    nan = norm_color(nan) or nan
+    unlisted: Optional[int] = None
+    if d.tree is not None:
+        tree, listed = d.tree, set()
+        for row in d.f.rows:
+            n = tree.resolve(row[0])
+            if n is not None:
+                listed.update(range(tree.L[n], tree.R[n]))
+        unlisted = len(tree.leaves) - len(listed)
+    if unlisted == 0:
+        if x_cells and nan:
+            d.by_hand.append(f"COLOR_NAN {nan} → No-value colour: {nan}")
+        return
+    where = (f"{plural(unlisted, 'leaf', 'leaves')} of the tree {'is' if unlisted == 1 else 'are'} not in this file"
+             if unlisted else "for leaves this file does not list")
+    if x_cells and nan:
+        d.by_hand.append(f"COLOR_NAN {nan} → No-value colour: {nan} colours the 'X' cells, but mitol also fills every "
+                         f"leaf without a value here with it ({where}), which iTOL leaves empty: clear it unless that "
+                         "is wanted")
+    else:
+        d.by_hand.append(f"No-value colour: clear it; mitol fills every leaf without a value here in grey ({where}), "
+                         "iTOL leaves them empty")
 
 
 def conv_externalshape(d: Dataset) -> None:
@@ -1096,36 +1303,45 @@ def conv_externalshape(d: Dataset) -> None:
 
 
 def conv_piechart(d: Dataset) -> None:
-    keys = d.field_columns(3, "numeric", policy="keep")
-    kr = d.add("radius", f"{d.label} radius", "numeric", policy="keep", optional=True)
-    external = node_pies = 0
-    radii = set()
+    """External pies (position -1) → a Pie charts ring; pies on internal nodes or on branches (position 0–1)
+    → '<field> (node)' columns for Tree decorations → Node pie charts, so no pie is drawn twice."""
+    ext_rows, node_rows = [], []
     for row in d.f.rows:
         pos = js_number(row_get(row, 1))
-        if d.is_internal(row[0]) or (pos is not None and pos >= 0):
-            node_pies += 1
-        else:
-            external += 1
-        for i, k in enumerate(keys):
-            d.put_number(row[0], k, row_get(row, 3 + i))
-        d.put_number(row[0], kr, row_get(row, 2))
-        radii.add(row_get(row, 2))
+        (node_rows if d.is_internal(row[0]) or (pos is not None and pos >= 0) else ext_rows).append(row)
+    labels = d.field_labels(max(0, max((len(r) - 3 for r in d.f.rows), default=0)))
+    keys = [d.add(f"f{i}", lab, "numeric", "keep", field_of=d.label) for i, lab in enumerate(labels)] if ext_rows else []
+    nkeys = [d.add(f"n{i}", f"{lab} (node)" if ext_rows else lab, "numeric", "keep", field_of=d.label)
+             for i, lab in enumerate(labels)] if node_rows else []
+    for rows, ks in ((ext_rows, keys), (node_rows, nkeys)):
+        for row in rows:
+            for i, k in enumerate(ks):
+                d.put_number(row[0], k, row_get(row, 3 + i))
     d.field_colors(keys)
-    d.feature = "Pie charts ring" if external >= node_pies else "Node pie charts (decoration)"
-    if external or not d.f.rows:
-        size = "; Pie size: From a column → Size column: [[radius]]" if len(radii) > 1 else ""
-        d.steps.append(f"Annotation Tracks → + Add ring… → Type: Pie charts → tick {ticks(keys)} → Add ring{size} "
-                       "(Slice colours from colors.tsv).")
-    if node_pies:
-        d.steps.append(f"Tree decorations → Node pie charts → tick {ticks(keys)} ({plural(node_pies, 'pie')} on "
-                       "internal nodes or branches; tick 'size by total' for pies sized by their sum). Node pie slice "
-                       "colours follow the tick order (mitol palette), not colors.tsv.")
-    d.hints({
-        "POLAR_AREA_DIAGRAM": lambda v: "Style: Polar area diagram" if on(v) else None,
-        "BORDER_WIDTH": lambda v: f"Border width: {v}" if positive(v) else None,
-        "BORDER_COLOR": lambda v: f"Border colour: {v}" if positive(d.f.get('BORDER_WIDTH')) else None,
-        "MAXIMUM_SIZE": lambda v: f"Maximum radius: {v} (node pies: Tree decorations radius {min(40, round(js_number(v) or 9))})",
-    })
+    d.field_colors(nkeys)
+    d.used.add("MAXIMUM_SIZE")
+    d.feature = " + ".join(x for x, n in (("Pie charts ring", ext_rows), ("Node pie charts (decoration)", node_rows)) if n)
+    if ext_rows:
+        d.steps.append(f"Annotation Tracks → + Add ring… → Type: Pie charts → tick {ticks(keys)} → Add ring "
+                       f"({plural(len(ext_rows), 'external pie')}; slice colours from colors.tsv).")
+        d.hints({
+            "POLAR_AREA_DIAGRAM": lambda v: "Style: Polar area diagram" if on(v) else None,
+            "BORDER_WIDTH": lambda v: f"Border width: {v}" if positive(v) else None,
+            "BORDER_COLOR": lambda v: f"Border colour: {v}" if positive(d.f.get('BORDER_WIDTH')) else None,
+        })
+    if node_rows:
+        mx = js_number(d.f.get("MAXIMUM_SIZE"))
+        radius = f", radius {int(min(40, max(3, round(mx))))} (MAXIMUM_SIZE)" if mx else ""
+        d.steps.append(f"Tree decorations → Node pie charts → tick {ticks(nkeys)}{radius} ({plural(len(node_rows), 'pie')} "
+                       "on internal nodes or branches). Node pie slice colours follow the tick order (mitol palette), "
+                       "not colors.tsv.")
+    radii = {row_get(r, 2).strip() for r in node_rows}
+    if len(radii) > 1:
+        d.notes.append("Per-pie radii are not carried over: iTOL sizes internal pies by their RADIUS field, mitol's "
+                       "node pies have one radius ('size by total' sizes them by their sum instead).")
+    if ext_rows and node_rows:
+        d.notes.append("External pies (position -1) and pies on nodes / branches are in separate columns "
+                       f"({ticks(keys[:1] + nkeys[:1])} …), so each pie is drawn once.")
 
 
 def conv_binary(d: Dataset) -> None:
@@ -1147,7 +1363,7 @@ def conv_binary(d: Dataset) -> None:
                    "(Colours from colors.tsv).")
     if shapes:
         named = [f"[[{k}]] {ITOL_SHAPES.get(s, f'iTOL shape {s} (no equivalent)')}" for k, s in zip(keys, shapes)]
-        d.steps.append("Shapes: " + ", ".join(named) + ".")
+        d.steps.append("on the new ring, **Style ▾** → Shapes: " + ", ".join(named) + ".")
     d.hints({
         "SYMBOL_SPACING": lambda v: f"Column width: {v}",
         "HORIZONTAL_GRID": lambda v: f"Horizontal grid: {on_off(v)}",
@@ -1212,6 +1428,13 @@ def conv_symbol(d: Dataset) -> None:
             d.put_number(rid, zkeys[slot], size)
     for k, p in pairs.items():
         d.key_colors(k, p)
+    # Each value's most common iTOL shape, for Leaf markers' "per value" shapes.
+    for rid, slot, shape, size, c, fill, value in entries:
+        cnt = shapes_by_value.get(value)
+        if cnt and value.strip():
+            code = cnt.most_common(1)[0][0]
+            if code in MITOL_SHAPES:
+                d.shapes[(keys[slot], value.strip())] = MITOL_SHAPES[code]
     if ambiguous:
         d.warnings.append(f"{plural(sum(ambiguous.values()), 'symbol')} match several legend entries (same shape and "
                           f"colour); their value names all of them: {short_list(sorted(ambiguous))}")
@@ -1221,23 +1444,22 @@ def conv_symbol(d: Dataset) -> None:
     fills = Counter(e[5].strip() for e in entries)
     max_size = js_number(d.f.get("MAXIMUM_SIZE")) or 0
     d.used.add("MAXIMUM_SIZE")
-    size_txt = f", size {int(min(24, max(3, round(max_size))))}" if max_size else ""
+    size_txt = f", size {int(min(30, max(3, round(max_size))))}" if max_size else ""
     filled = "untick filled" if fills and set(fills) == {"0"} else "filled"
-    d.feature = "Node symbols (decoration)"
-    d.steps.append(f"Tree decorations → Node symbols → Symbol by: [[s0]]; shape {ITOL_SHAPES.get(main_shape, 'Circle')}"
-                   f"{size_txt}, {filled} (colours from colors.tsv). [[s0]] also works as a colour strip ring.")
+    d.feature = "Leaf markers (decoration)"
     if len(shape_count) > 1:
-        per = sorted(f"{v}: {ITOL_SHAPES.get(cnt.most_common(1)[0][0], 'shape ' + cnt.most_common(1)[0][0])}"
-                     for v, cnt in shapes_by_value.items() if cnt.most_common(1)[0][0] != main_shape)
-        d.notes.append("iTOL draws some values with another shape (mitol uses one shape per decoration): "
-                       + ", ".join(per) + ".")
+        shape_txt = "tick per value (shapes from colors.tsv)"
+    else:
+        shape_txt = f"shape {ITOL_SHAPES.get(main_shape, 'Circle')}"
+    d.steps.append(f"Tree decorations → Leaf markers → + Add marker rule → column [[s0]] (has a value); {shape_txt}, "
+                   f"column colours{size_txt}, {filled}. [[s0]] also works as a colour strip ring.")
     if multi:
         d.steps.append(f"Symbols in other positions are in {ticks(list(keys.values())[1:])} (one column per position).")
     if any(s[0].startswith("external") for s in slots):
         d.notes.append("iTOL draws external symbols (negative position) in columns outside the tree: in mitol use the "
-                       "column as a colour strip ring, or as node symbols at the leaves.")
+                       "column as a colour strip ring, or as Leaf markers at the tips.")
     if zkeys:
-        d.notes.append(f"Symbol sizes vary ({ticks(zkeys.values())}); mitol node symbols have one size.")
+        d.notes.append(f"Symbol sizes vary ({ticks(zkeys.values())}); a Leaf markers rule has one size (use one rule per size with is / ≥ conditions).")
 
 
 def conv_domains(d: Dataset) -> None:
@@ -1245,7 +1467,7 @@ def conv_domains(d: Dataset) -> None:
     kd = d.add("domains", f"{stem} domains", "domains")
     kl = d.add("length", f"{stem} length", "numeric", optional=True)
     d.pairs.append((kd, kl, stem))
-    bad = Counter()
+    bad, odd_shape, backwards, bad_len = Counter(), Counter(), [], Counter()
     for row in d.f.rows:
         items = []
         for it in row[2:]:
@@ -1256,12 +1478,15 @@ def conv_domains(d: Dataset) -> None:
             if not (re.fullmatch(r"-?\d+(?:\.\d+)?", start) and re.fullmatch(r"\d+(?:\.\d+)?", end)):
                 bad[it] += 1
                 continue
+            if float(start) > float(end):
+                backwards.append(it)
+                continue
             name = re.sub(r"\s+", " ", re.sub(r"[;|]", " ", row_get(p, 4))).strip()
             item = f"{name}:{start}-{end}"
             if shape in DOMAIN_SHAPES:
                 item += f":{shape}"
             elif shape:
-                bad[f"shape {p[0]}"] += 1
+                odd_shape[p[0]] += 1
             c = d.color(row_get(p, 3))
             if c:
                 item += f":{c}"
@@ -1270,9 +1495,22 @@ def conv_domains(d: Dataset) -> None:
         if re.fullmatch(r"\d+(?:\.\d+)?", length) and float(length) > 0:
             items.append(f"len={length}")
             d.put(row[0], kl, length)
+        elif length:
+            bad_len[length] += 1
         d.put(row[0], kd, ";".join(items))
     if bad:
-        d.warnings.append(f"{plural(sum(bad.values()), 'unreadable domain item')} or shape(s) skipped ({short_list(sorted(bad))})")
+        d.warnings.append(f"{plural(sum(bad.values()), 'unreadable domain item')} skipped (SHAPE|START|END|COLOR|LABEL "
+                          f"needs numbers for START and END): {short_list(sorted(bad))}")
+    if backwards:
+        d.warnings.append(f"{plural(len(backwards), 'domain')} with START after END skipped, as iTOL skips them "
+                          f"(mitol would swap the ends): {short_list(backwards)}")
+    if odd_shape:
+        n = sum(odd_shape.values())
+        d.warnings.append(f"{plural(n, 'domain')} with an unknown shape code {'is' if n == 1 else 'are'} drawn with the "
+                          f"ring's default shape: {short_list(sorted(odd_shape))}")
+    if bad_len:
+        d.warnings.append(f"{plural(sum(bad_len.values()), 'protein length')} that {'is' if sum(bad_len.values()) == 1 else 'are'} "
+                          f"not a positive number left blank: {short_list(sorted(bad_len))}")
     d.feature = "Protein domains ring"
     has_length = any(kl in r for r in d.rows.values())
     d.steps.append("Annotation Tracks → + Add ring… → Type: Protein domains → choose [[domains]] → Add ring"
@@ -1294,8 +1532,11 @@ def conv_domains(d: Dataset) -> None:
 
 
 def strip_tags(txt: str) -> str:
-    """Text of an iTOL rich-text label: the <n> <b> <i> <bi> <sub> <sup> tags removed, other text kept."""
-    txt = re.sub(r"<(sup|sub)\b", r" <\1", txt)  # "sapiens<sup>x" → "sapiens x"
+    """Text of an iTOL rich-text label: the <n> <b> <i> <bi> <sub> <sup> tags removed, other text kept. A sub- or
+    superscript joins its word ("H<sub>2</sub>O" → "H2O", "Na<sup>+</sup>" → "Na+") unless it is a word itself
+    ("sapiens<sup>citation</sup>" → "sapiens citation")."""
+    txt = re.sub(r"<(sub|sup)(?:\s[^<>]*)?>(.*?)</\1>",
+                 lambda m: (" " if re.search(r"[^\W\d_]{2}", m.group(2)) else "") + m.group(2), txt)
     return re.sub(r"\s+", " ", ITOL_TAG.sub("", txt)).strip()
 
 
@@ -1325,13 +1566,14 @@ def conv_text(d: Dataset) -> None:
     d.feature = "Text labels ring"
     d.steps.append("Annotation Tracks → + Add ring… → Type: Text labels → choose [[text]] → Add ring.")
     if len(colours) == 1:
-        d.steps.append(f"Colour: {colours.pop()}.")
+        d.steps.append(f"on the new ring, **Style ▾** → Colour: {colours.pop()}.")
     elif colours:
         d.key_colors(k, pairs)
-        d.steps.append("Tick 'Use the column's category colours' (per-label colours are in colors.tsv).")
+        d.steps.append("on the new ring, **Style ▾** → tick 'Use the column's category colours' (per-label colours "
+                       "are in colors.tsv).")
     if len(styles) == 1 and next(iter(styles)) in ("bold", "italic", "bold-italic"):
         st = next(iter(styles))
-        d.steps.append("Tick " + " and ".join(f"'{w.capitalize()}'" for w in st.split("-")) + ".")
+        d.steps.append("on the new ring, **Style ▾** → tick " + " and ".join(f"'{w.capitalize()}'" for w in st.split("-")) + ".")
     elif len(styles) > 1:
         d.notes.append(f"Per-label font styles are not carried over ({', '.join(sorted(styles))}); Bold / Italic apply to the whole ring.")
     if set(sizes) - {"1"}:
@@ -1355,6 +1597,8 @@ def conv_text(d: Dataset) -> None:
 
 def conv_connection(d: Dataset) -> None:
     widths = [js_number(row_get(r, 2)) for r in d.f.rows]
+    bad_w = Counter(row_get(r, 2).strip() for r, w in zip(d.f.rows, widths)
+                    if row_get(r, 2).strip() and (w is None or w <= 0))
     max_w = max((w for w in widths if w is not None and w > 0), default=0)
     max_line = js_number(d.f.get("MAXIMUM_LINE_WIDTH"))
     d.used.add("MAXIMUM_LINE_WIDTH")
@@ -1377,6 +1621,10 @@ def conv_connection(d: Dataset) -> None:
         })
     if one_end:
         d.warnings.append(f"{plural(one_end, 'row')} without both ends skipped")
+    if bad_w:
+        n = sum(bad_w.values())
+        d.warnings.append(f"{plural(n, 'width')} that {'is' if n == 1 else 'are'} not a positive number left blank "
+                          f"(mitol's default width): {short_list(sorted(bad_w))}")
     if not_found:
         d.warnings.append(f"{plural(sum(not_found.values()), 'connection end')} not found in the tree: {short_list(sorted(not_found))}")
     if scale:
@@ -1388,7 +1636,7 @@ def conv_connection(d: Dataset) -> None:
     d.steps.append("Tree decorations → Connections: Show connections (the file chip shows ⇄).")
     c = norm_color(d.f.get("COLOR"))
     if c:
-        d.steps.append(f"Default colour swatch: {c} (used by rows without a colour).")
+        d.steps.append(f"Tree decorations → Connections → default colour swatch: {c} (used by rows without a colour).")
     d.hints({
         "DRAW_ARROWS": lambda v: "Arrowheads at the target: on" if on(v) else None,
         "CENTER_CURVES": lambda v: "Curve: Through the centre (radial)" if on(v) else None,
@@ -1396,23 +1644,139 @@ def conv_connection(d: Dataset) -> None:
     })
 
 
-def _branch_label_columns(d: Dataset) -> Dict[str, str]:
-    """Decoration columns shared by DATASET_STYLE and TREE_COLORS (dropped when empty)."""
+def _branch_label_columns(d: Dataset, background_row: bool) -> Dict[str, str]:
+    """Decoration columns shared by DATASET_STYLE and TREE_COLORS (dropped when empty). Label colour and style
+    come from one iTOL row; so does the background in DATASET_STYLE (`background_row` False), while TREE_COLORS
+    sets it on a row of its own."""
     return {
         "bc": d.add("bc", f"{d.label} branch color", "colour", policy="keep", optional=True),
         "bw": d.add("bw", f"{d.label} branch width", "numeric", policy="keep", optional=True),
-        "lc": d.add("lc", f"{d.label} label color", "colour", optional=True),
-        "ls": d.add("ls", f"{d.label} label style", "category", optional=True),
-        "lb": d.add("lb", f"{d.label} label background", "colour", optional=True),
+        "lc": d.add("lc", f"{d.label} label color", "colour", optional=True, group="label"),
+        "ls": d.add("ls", f"{d.label} label style", "category", optional=True, group="label"),
+        "lb": d.add("lb", f"{d.label} label background", "colour", optional=True,
+                    group="background" if background_row else "label"),
     }
+
+
+# Approximations counted per decoration file: (one, many, rest of the warning).
+NARROW = ("branch width factor below 1", "branch width factors below 1",
+          ": mitol cannot draw thinner branches (Branch width by widens 1–3× by value), so these come out wider "
+          "than unlisted branches")
+ONE_INTERNAL_BRANCH = ("single-branch colour on an internal node", "single-branch colours on internal nodes",
+                       ": mitol colours the whole clade")
+CLADE_WIDTH_NO_TREE = ("clade branch width", "clade branch widths",
+                       ": mitol widens only the branch leading to the clade (pass --tree to write the factor on "
+                       "every branch of the clade, as iTOL draws it)")
+DASHED = ("dashed branch style", "dashed branch styles", " not carried over (mitol has no dashed branches)")
+INTERNAL_LABEL = ("internal-node label style", "internal-node label styles", " skipped (mitol styles leaf labels only)")
+LABEL_SIZE = ("label size factor", "label size factors", " not carried over")
 
 
 def _branch_width(d: Dataset, rid: str, key: str, factor: str, approx: Counter) -> None:
     d.put_number(rid, key, factor)
     w = js_number(factor)
     if w is not None and w < 1:
-        approx["branch width factor(s) below 1: mitol cannot draw thinner branches (Branch width by widens 1–3× "
-               "by value), so these come out wider than unlisted branches"] += 1
+        approx[NARROW] += 1
+
+
+def _clade_widths(d: Dataset, key: str, clade_widths: List[Tuple[str, str]], approx: Counter) -> None:
+    """iTOL's 'clade' width factor widens every branch of the clade, mitol's Branch width by one branch per row:
+    with --tree, write the factor on every node of the clade (a node's own row, then the smallest clade, wins)."""
+    tree = d.tree
+    if tree is None:
+        for rid, factor in clade_widths:
+            _branch_width(d, rid, key, factor, approx)
+        if clade_widths:
+            approx[CLADE_WIDTH_NO_TREE] += len(clade_widths)
+        return
+    explicit = {n for n in (tree.resolve(rid) for rid, r in d.rows.items() if key in r) if n is not None}
+    own: Dict[int, str] = {}  # clade node → its factor (the later row wins)
+    for rid, factor in clade_widths:
+        node, w = tree.resolve(rid), js_number(factor)
+        if node is None or w is None:
+            _branch_width(d, rid, key, factor, approx)  # reported as not found / not a number
+            continue
+        own[node] = factor
+        if w < 1:
+            approx[NARROW] += 1
+    unnamed = 0
+    inherited: List[Optional[str]] = [None] * len(tree.parent)
+    for v in range(len(tree.parent)):  # parents come before their children
+        p = tree.parent[v]
+        factor = own.get(v, inherited[p] if p != -1 else None)
+        inherited[v] = factor
+        if factor is None or v in explicit:
+            continue
+        rid = tree.ref(v)
+        if rid:
+            d.put_number(rid, key, factor)
+        else:
+            unnamed += 1
+    if own:
+        d.notes.append(f"{plural(len(own), 'clade branch width')} written on every branch of {'its' if len(own) == 1 else 'their'} "
+                       "clade (iTOL widens them all; --tree); rows of single branches kept.")
+    if unnamed:
+        d.warnings.append(f"{plural(unnamed, 'branch', 'branches')} inside wide clades left out: no name or "
+                          "'first leaf|last leaf' spelling resolves to them")
+
+
+def _split_branch_colours(d: Dataset, key: str) -> None:
+    """mitol paints a clade row's colour over every branch below it, leaves included, while iTOL keeps a leaf's
+    own branch colour inside a coloured clade. Clade rows above such leaves are split into rows for their largest
+    parts without them, so those leaves keep their colour; the branches on the way to them lose the clade colour."""
+    tree = d.tree
+    assert tree is not None
+    clade: Dict[int, List[str]] = {}  # internal node → its row ids (one spelling after unify_clade_ids)
+    leaf_colour: Dict[int, str] = {}
+    for rid, row in d.rows.items():
+        n = tree.resolve(rid) if row.get(key) else None
+        if n is None:
+            continue
+        if tree.is_leaf(n):
+            leaf_colour[n] = row[key]
+        else:
+            clade.setdefault(n, []).append(rid)
+    if not clade or not leaf_colour:
+        return
+    colour_of = {n: d.rows[rids[-1]][key] for n, rids in clade.items()}  # the last row wins, as in mitol
+    cover: List[Optional[int]] = [None] * len(tree.parent)  # the smallest clade row containing each node
+    for v in range(len(tree.parent)):  # parents come before their children
+        p = tree.parent[v]
+        cover[v] = v if v in clade else cover[p] if p != -1 else None
+    conflict = [v for v, c in leaf_colour.items() if cover[v] is not None and colour_of[cover[v]] != c]
+    if not conflict:
+        return
+    blocked: Set[int] = set()  # internal nodes above those leaves
+    for v in conflict:
+        u = tree.parent[v]
+        while u != -1 and u not in blocked:
+            blocked.add(u)
+            u = tree.parent[u]
+    removed = 0
+    for n in blocked & set(clade):
+        for rid in clade[n]:
+            del d.rows[rid][key]
+            if not d.rows[rid]:
+                del d.rows[rid]
+        removed += 1
+    added = lost = 0
+    for u in sorted(blocked):
+        if cover[u] is not None:
+            lost += 1
+        for v in tree.children[u]:
+            if v in blocked or v in clade or v in leaf_colour:
+                continue  # on the way to a leaf, or a node with its own row
+            cv, rid = cover[v], tree.ref(v)
+            if cv is not None and rid:
+                d.rows.setdefault(rid, {})[key] = colour_of[cv]
+                added += 1
+    names = [tree.name[v] or "" for v in sorted(conflict, key=lambda x: tree.L[x])]
+    d.warnings.append(f"{plural(len(conflict), 'leaf', 'leaves')} with {'its' if len(conflict) == 1 else 'their'} own "
+                      f"branch colour inside a coloured clade ({short_list(names)}): mitol paints a clade row over "
+                      f"every branch below it, so {plural(removed, 'clade row')} {'was' if removed == 1 else 'were'} "
+                      f"split into {plural(added, 'row')} for the parts without those leaves; "
+                      f"{plural(lost, 'branch', 'branches')} on the way to them {'loses' if lost == 1 else 'lose'} "
+                      "the clade colour")
 
 
 def _decoration_steps(d: Dataset, keys: Dict[str, str], approx: Counter) -> None:
@@ -1422,6 +1786,12 @@ def _decoration_steps(d: Dataset, keys: Dict[str, str], approx: Counter) -> None
     if keys["bc"] in present:
         d.steps.append("Tree decorations → Branch colour: [[bc]]; untick 'Colour a clade's branches when all its "
                        "leaves agree' (iTOL colours only the branches it lists).")
+        if d.tree is not None:
+            d.after_tree.append(lambda: _split_branch_colours(d, keys["bc"]))
+        elif any(d.is_internal(rid) for rid, r in d.rows.items() if keys["bc"] in r):
+            d.notes.append("mitol paints a clade's branch colour over every branch below it, so a leaf with its own "
+                           "branch colour inside a coloured clade takes the clade colour; pass --tree to split such "
+                           "clade rows.")
     if keys["bw"] in present:
         d.steps.append("Tree decorations → Branch width by: [[bw]] (mitol widens 1–3× in proportion to the value, "
                        "not by iTOL's exact factor).")
@@ -1432,13 +1802,14 @@ def _decoration_steps(d: Dataset, keys: Dict[str, str], approx: Counter) -> None
                        "0.35; iTOL draws the full colour).")
     if keys["ls"] in present:
         d.steps.append("Tree decorations → Label style (bold/italic): [[ls]].")
-    for what, n in approx.items():
-        d.warnings.append(f"{n} {what}")
+    for (one, many, rest), n in approx.items():
+        d.warnings.append(f"{plural(n, one, many)}{rest}")
 
 
 def conv_style(d: Dataset) -> None:
-    keys = _branch_label_columns(d)
+    keys = _branch_label_columns(d, background_row=False)
     approx: Counter = Counter()
+    clade_widths: List[Tuple[str, str]] = []
     for row in d.f.rows:
         rid, typ, what = row[0], row_get(row, 1).lower(), row_get(row, 2).lower()
         c, factor, style, bg = d.color(row_get(row, 3)), row_get(row, 4), row_get(row, 5).lower(), row_get(row, 6)
@@ -1446,25 +1817,27 @@ def conv_style(d: Dataset) -> None:
         if typ == "branch":
             d.put(rid, keys["bc"], c)
             if internal and what == "node" and c:
-                approx["single-branch colour(s) on internal nodes: mitol colours the whole clade"] += 1
+                approx[ONE_INTERNAL_BRANCH] += 1
             if factor and factor != "1":
-                _branch_width(d, rid, keys["bw"], factor, approx)
                 if internal and what == "clade":
-                    approx["clade branch width(s): mitol widens only the branch leading to the clade"] += 1
+                    clade_widths.append((rid, factor))
+                else:
+                    _branch_width(d, rid, keys["bw"], factor, approx)
             if style == "dashed":
-                approx["dashed branch style(s) not carried over (mitol has no dashed branches)"] += 1
+                approx[DASHED] += 1
         elif typ == "label":
             if internal and what == "node":
-                approx["internal-node label style(s) skipped (mitol styles leaf labels only)"] += 1
+                approx[INTERNAL_LABEL] += 1
                 continue
             d.put(rid, keys["lc"], c)
             if style in ("bold", "italic", "bold-italic"):
                 d.put(rid, keys["ls"], style)
             d.put(rid, keys["lb"], d.color(bg))
             if factor and factor != "1":
-                approx["label size factor(s) not carried over"] += 1
+                approx[LABEL_SIZE] += 1
         else:
-            approx[f"row(s) with unknown type '{typ}' skipped"] += 1
+            approx[(f"row with unknown type '{typ}'", f"rows with unknown type '{typ}'", " skipped")] += 1
+    _clade_widths(d, keys["bw"], clade_widths, approx)
     d.feature = "Tree decorations (branch / label style)"
     _decoration_steps(d, keys, approx)
 
@@ -1543,9 +1916,10 @@ def _range_step(keys: List[str]) -> str:
 
 
 def conv_tree_colors(d: Dataset) -> None:
-    keys = _branch_label_columns(d)
+    keys = _branch_label_columns(d, background_row=True)
     approx: Counter = Counter()
     ranges: List[Tuple[str, str, str, int]] = []  # (id, value, colour, order)
+    clade_widths: List[Tuple[str, str]] = []
     for order, row in enumerate(d.f.rows):
         rid, typ, c = row[0], row_get(row, 1).lower(), d.color(row_get(row, 2))
         f4, f5 = row_get(row, 3), row_get(row, 4)
@@ -1554,23 +1928,25 @@ def conv_tree_colors(d: Dataset) -> None:
         elif typ in ("clade", "branch"):
             d.put(rid, keys["bc"], c)
             if typ == "branch" and d.is_internal(rid) and c:
-                approx["single-branch colour(s) on internal nodes: mitol colours the whole clade"] += 1
+                approx[ONE_INTERNAL_BRANCH] += 1
             if f4.lower() == "dashed":
-                approx["dashed branch style(s) not carried over (mitol has no dashed branches)"] += 1
+                approx[DASHED] += 1
             if f5 and f5 != "1":
-                _branch_width(d, rid, keys["bw"], f5, approx)
                 if typ == "clade" and d.is_internal(rid):
-                    approx["clade branch width(s): mitol widens only the branch leading to the clade"] += 1
+                    clade_widths.append((rid, f5))
+                else:
+                    _branch_width(d, rid, keys["bw"], f5, approx)
         elif typ == "label":
             d.put(rid, keys["lc"], c)
             if f4.lower() in ("bold", "italic", "bold-italic"):
                 d.put(rid, keys["ls"], f4.lower())
             if f5 and f5 != "1":
-                approx["label size factor(s) not carried over"] += 1
+                approx[LABEL_SIZE] += 1
         elif typ == "label_background":
             d.put(rid, keys["lb"], c)
         else:
-            approx[f"row(s) with unknown type '{typ}' skipped"] += 1
+            approx[(f"row with unknown type '{typ}'", f"rows with unknown type '{typ}'", " skipped")] += 1
+    _clade_widths(d, keys["bw"], clade_widths, approx)
     range_keys: List[str] = []
     if ranges and d.tree is None:
         kr = d.add("rg", f"{d.label} range", "category")
@@ -1596,7 +1972,8 @@ def conv_tree_colors(d: Dataset) -> None:
         if missing:
             d.warnings.append(f"{plural(len(missing), 'range id')} not found in the tree: {short_list(missing)}")
         if bad:
-            d.warnings.append(f"{plural(len(bad), 'CONTAINS== range pattern')} skipped (not a valid regular expression)")
+            d.warnings.append(f"{plural(len(bad), 'CONTAINS== range pattern')} skipped (not a valid regular "
+                              f"expression): {short_list(bad)}")
         range_keys = range_columns(d, "rg", f"{d.label} range", spans)
     d.feature = "Tree decorations (branch / label colours, ranges)"
     _decoration_steps(d, keys, approx)
@@ -1616,22 +1993,32 @@ def conv_range(d: Dataset) -> None:
             a, b = row_get(row, 0), row_get(row, 1)
             c = d.color(row_get(row, 2))
             value = row_get(row, 7) or c
-            d.put(f"{a}|{b}" if b and b != a else a, k, value)
+            d.put(f"{a}|{b}" if b and b != a and not a.startswith(CONTAINS) else a, k, value)
             pairs.append((value, c))
         d.key_colors(k, pairs)
         if rows:
+            d.unexpanded = True
             d.warnings.append("ranges are written as 'start|end' rows: re-run with --tree to write one row per leaf "
                               "('From a column' needs leaf rows)")
         keys = [k]
     else:
         tree = d.tree
-        spans, missing, patterns = [], [], 0
+        spans, missing, bad_rx, empty = [], [], [], []
+        patterns = matched = 0
         for order, row in enumerate(rows):
             a, b = row_get(row, 0), row_get(row, 1) or row_get(row, 0)
-            if a.startswith(CONTAINS) or b.startswith(CONTAINS):
-                patterns += 1
-                continue
             c = d.color(row_get(row, 2))
+            if a.startswith(CONTAINS):  # iTOL: one range per matching node, END_NODE_ID ignored
+                patterns += 1
+                nodes = tree.match(a[len(CONTAINS):])
+                if nodes is None:
+                    bad_rx.append(a)
+                elif not nodes:
+                    empty.append(a)
+                for n in nodes or []:
+                    spans.append(Span(tree.L[n], tree.R[n], row_get(row, 7) or c, c, order, weak=True))
+                    matched += 1
+                continue
             na, nb = tree.resolve(a), tree.resolve(b)
             if na is None or nb is None:
                 missing.append(a if na is None else b)
@@ -1640,9 +2027,15 @@ def conv_range(d: Dataset) -> None:
             spans.append(Span(lo, hi, row_get(row, 7) or c, c, order))
         if missing:
             d.warnings.append(f"{plural(len(missing), 'range end')} not found in the tree: {short_list(missing)}")
-        if patterns:
-            d.warnings.append(f"{plural(patterns, 'range row')} using CONTAINS== skipped (only START / END node ids "
-                              "can be converted to leaf spans)")
+        if matched:
+            d.notes.append(f"{plural(patterns - len(bad_rx) - len(empty), 'CONTAINS== range row')} made "
+                           f"{plural(matched, 'range')}, one per matching node (as iTOL; END_NODE_ID is ignored there).")
+        if bad_rx:
+            d.warnings.append(f"{plural(len(bad_rx), 'CONTAINS== range pattern')} skipped (not a valid regular "
+                              f"expression): {short_list(bad_rx)}")
+        if empty:
+            d.warnings.append(f"{plural(len(empty), 'CONTAINS== range pattern')} {'matches' if len(empty) == 1 else 'match'} "
+                              f"no node of the tree: {short_list(empty)}")
         keys = range_columns(d, "range", d.label, spans)
         if spans:
             d.notes.append("Each range covers the leaves from START to END in the tree file's leaf order.")
@@ -1682,6 +2075,12 @@ def conv_alignment(d: Dataset) -> None:
             seqs[cur].append(re.sub(r"\s+", "", line))
     for rid, parts in seqs.items():
         d.put(rid, k, "".join(parts))
+    first = next((i for i, line in enumerate(d.f.lines) if line.startswith(">")), len(d.f.lines))
+    if not seqs and d.f.lines:
+        d.warnings.append("no FASTA record found: the DATA section of an alignment dataset is '>id' lines, each "
+                          "followed by its sequence")
+    elif first:
+        d.warnings.append(f"{plural(first, 'line')} before the first '>id' line ignored")
     if repeated:
         d.warnings.append(f"{plural(len(repeated), 'repeated sequence id')}; the first sequence of each is kept "
                           f"({short_list(repeated)})")
@@ -1775,8 +2174,8 @@ def conv_boxplot(d: Dataset) -> None:
     fmt = "Summary: min, Q1, median, Q3, max[, extremes…]"
     if extremes:
         how = "detected automatically" if detected == "summary" else "set it by hand: mitol would guess Samples here"
-        d.steps.append(f"Annotation Tracks → + Add ring… → Type: Box plot → choose [[box]] → Add ring; Cell format: {fmt} "
-                       f"({how}).")
+        d.steps.append(f"Annotation Tracks → + Add ring… → Type: Box plot → choose [[box]] → Add ring; on the new ring "
+                       f"**Style ▾** → Cell format: {fmt} ({how}).")
     else:
         d.steps.append("Annotation Tracks → + Add ring… → Type: Box plot → choose [[box]] → Add ring (five numbers per "
                        "cell: either Cell format draws iTOL's box exactly).")
@@ -1788,24 +2187,26 @@ def conv_boxplot(d: Dataset) -> None:
 
 def conv_linechart(d: Dataset) -> None:
     k = d.add("line", d.label, "list")
-    bad = 0
+    bad: List[str] = []
     for row in d.f.rows:
         pts = []
         for p in row[1:]:
-            if "|" in p:
-                x, y = (s.strip() for s in p.split("|", 1))
-                pts.append(f"{x}:{y}")
+            xy = [t.strip() for t in p.split("|")]
+            if len(xy) == 2 and js_number(xy[0]) is not None and js_number(xy[1]) is not None:
+                pts.append(f"{xy[0]}:{xy[1]}")
             elif p.strip():
-                bad += 1
+                bad.append(p.strip())
         d.put(row[0], k, " ".join(pts))
     if bad:
-        d.warnings.append(f"{plural(bad, 'point')} without an 'X|Y' pair skipped")
+        d.warnings.append(f"{plural(len(bad), 'point')} that {'is' if len(bad) == 1 else 'are'} not an 'X|Y' pair of "
+                          f"numbers skipped: {short_list(bad)}")
     line = d.f.get("DEFAULT_LINE_COLOR") or d.f.get("COLOR")
     d.used.add("DEFAULT_LINE_COLOR")
     d.key_color(k, "(color)", line)
     d.feature = "Line chart ring"
-    d.steps.append("Annotation Tracks → + Add ring… → Type: Line chart → choose [[line]] → Add ring"
-                   + (f"; Line colour: {norm_color(line) or line}." if line else "."))
+    d.steps.append("Annotation Tracks → + Add ring… → Type: Line chart → choose [[line]] → Add ring.")
+    if line:
+        d.steps.append(f"on the new ring, **Style ▾** → Line colour: {norm_color(line) or line}.")
     d.hints({
         "LINE_COLORS": lambda v: f"Colour by Y: {' '.join(d.f.values('LINE_COLORS'))}",
         "AXIS_X": lambda v: f"Lines at Y: {' '.join(d.f.values('AXIS_X'))}",
@@ -1876,7 +2277,7 @@ CONVERTERS: Dict[str, Callable[[Dataset], None]] = {
 
 
 def convert(path: str, kind: str, tree: Optional[Tree], display: str = "") -> Dataset:
-    d = Dataset(read_itol(path, kind), tree)
+    d = Dataset(read_itol(path, kind, tree.by_name if tree is not None else None), tree)
     d.display = display or d.f.name
     CONVERTERS[kind](d)
     d.finish()
@@ -1935,7 +2336,7 @@ def assign_names(datasets: List[Dataset], outside: Optional[Dict[str, str]] = No
         return name not in taken and name.strip().lower() not in RESERVED_COLUMNS
 
     def unique(name: str, d: Dataset) -> str:
-        name = re.sub(r"\s+", " ", name).strip() or "value"
+        name = re.sub(r"\s+", " ", clean_text(name)).strip() or "value"
         first = name
         if not free(name):
             name = f"{name} ({d.short})"
@@ -1945,7 +2346,7 @@ def assign_names(datasets: List[Dataset], outside: Optional[Dict[str, str]] = No
                     k += 1
                 name = f"{name} {k}"
         if first in outside:
-            d.notes.append(f"'{first}' is already a column of {outside[first]}, so this one is named '{name}'.")
+            d.renamed.append(f"'{first}' is already a column of {outside[first]}, so this one is named '{name}'")
         taken.add(name)
         return name
 
@@ -1953,7 +2354,7 @@ def assign_names(datasets: List[Dataset], outside: Optional[Dict[str, str]] = No
     for d in datasets:
         paired = {k for kd, kl, _ in d.pairs for k in (kd, kl)}
         for kd, kl, stem in d.pairs:  # "<x> domains" + "<x> length": mitol pairs them by name
-            stem = re.sub(r"\s+", " ", stem).strip() or "protein"
+            stem = re.sub(r"\s+", " ", clean_text(stem)).strip() or "protein"
             cand, k = stem, 2
             while not (free(f"{cand} domains") and free(f"{cand} length")):
                 cand, k = f"{stem} {k}", k + 1
@@ -1995,9 +2396,15 @@ def assign_files(datasets: List[Dataset], foreign: Iterable[str] = (), reuse: Op
         d.out_file = name
 
 
+def clean_text(v: str) -> str:
+    """No tabs / line breaks (→ space) and no other control characters (NUL …)."""
+    v = re.sub(r"[\t\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]+", " ", v)
+    return re.sub(r"[\x00-\x08\x0e-\x1b\x1f\x7f]", "", v).strip()
+
+
 def tsv_cell(v: str) -> str:
-    """One cell: no tabs / newlines; a leading quote is quoted (d3's TSV reader would unquote it)."""
-    v = re.sub(r"[\t\r\n]+", " ", v).strip()
+    """One cell, cleaned; a leading quote is quoted (d3's TSV reader would unquote it)."""
+    v = clean_text(v)
     return '"' + v.replace('"', '""') + '"' if v.startswith('"') else v
 
 
@@ -2039,11 +2446,12 @@ def dataset_text(d: Dataset) -> str:
 
 def colour_rows(d: Dataset) -> List[List[str]]:
     names = {c.key: c.name for c in d.columns}
-    return [[names[k], v, c] for k, v, c in d.colors if k in names]
+    return [[names[k], v, c, d.shapes.get((k, v), "")] for k, v, c in d.colors if k in names]
 
 
 def render(d: Dataset, text: str, quote: str = "`") -> str:
-    names = {c.key: c.name for c in d.columns}
+    """Text with [[key]] replaced by the column's name (its preferred name for a column dropped as empty)."""
+    names = {**d.wants, **{c.key: c.name for c in d.columns if c.name}}
     return re.sub(r"\[\[(\w+)\]\]", lambda m: f"{quote}{names.get(m.group(1), m.group(1))}{quote}", text)
 
 
@@ -2102,6 +2510,7 @@ def readme_section(d: Dataset) -> str:
     if d.by_hand:
         out.append(f"- Set by hand ({d.by_hand_where}): " + "; ".join(render(d, h) for h in d.by_hand))
     out += [f"- Note: {render(d, n)}" for n in d.notes]
+    out += [f"- Note: {n}." for n in d.renamed]
     if d.not_carried:
         out.append("- Not carried over: " + ", ".join(f"`{s}`" for s in d.not_carried))
     out += [f"- Warning: {render(d, w)}" for w in d.warnings]
@@ -2119,8 +2528,7 @@ def readme_text(entries: List[dict], carried: List[dict], skipped: List[Tuple[st
                 failed: List[Tuple[str, str]], sources: List[str], tree_path: Optional[str],
                 general: List[str]) -> str:
     out = [README_TITLE, ""]
-    out.append(f"Made by `scripts/itol2tsv.py`; last run on {datetime.date.today().isoformat()} from "
-               f"{sources_text(sources)}"
+    out.append(f"Made by `scripts/itol2tsv.py` from {sources_text(sources)}"
                + (f", ids checked against `{tree_path}`." if tree_path else " (no tree given: ids not checked).")
                + " Re-running a command overwrites the files it made"
                + (f"; {plural(len(carried), 'table')} made earlier from other inputs are kept (last rows of the "
@@ -2152,8 +2560,16 @@ def readme_text(entries: List[dict], carried: List[dict], skipped: List[Tuple[st
 # Output folder: ownership (manifest), shared folders
 # ============================================================
 
+def safe_name(n: object) -> bool:
+    """A plain file name inside OUTDIR (no folder part): manifest entries are never used as paths otherwise."""
+    return (isinstance(n, str) and n not in ("", ".", "..") and os.path.basename(n) == n
+            and "/" not in n and "\\" not in n and "\x00" not in n)
+
+
 def read_manifest(outdir: str) -> Optional[dict]:
-    """The manifest of an earlier run ({} when there is none; None when it exists but cannot be read)."""
+    """The manifest of an earlier run ({} when there is none; None when it exists but cannot be read).
+    Sources are stored relative to OUTDIR (version 2), so a copied folder maps to its own copies; they are
+    returned as absolute paths. Version 1 stored absolute paths ("legacy")."""
     path = os.path.join(outdir, MANIFEST)
     if not os.path.exists(path):
         return {}
@@ -2164,9 +2580,26 @@ def read_manifest(outdir: str) -> Optional[dict]:
         return None
     if not isinstance(m, dict) or not isinstance(m.get("files"), list) or not isinstance(m.get("outputs"), list):
         return None
-    m["outputs"] = [e for e in m["outputs"] if isinstance(e, dict) and isinstance(e.get("file"), str)
-                    and isinstance(e.get("source"), str)]
+    base = os.path.realpath(outdir)
+    m["legacy"] = m.get("version", 1) == 1
+    m["files"] = [n for n in m["files"] if safe_name(n)]
+    m["outputs"] = [e for e in m["outputs"] if isinstance(e, dict) and safe_name(e.get("file"))
+                    and isinstance(e.get("source"), str) and e["source"]]
+    for e in m["outputs"]:
+        e["source"] = os.path.normpath(os.path.join(base, e["source"]))  # an absolute source stays as it is
     return m
+
+
+def manifest_text(files: Iterable[str], outputs: List[dict], outdir: str) -> str:
+    base = os.path.realpath(outdir)
+
+    def rel(src: str) -> str:
+        try:
+            return os.path.relpath(src, base)
+        except ValueError:  # another drive (Windows)
+            return src
+    outs = [{**e, "source": rel(e["source"])} for e in outputs]
+    return json.dumps({"tool": "itol2tsv", "version": 2, "files": sorted(files), "outputs": outs}, indent=1) + "\n"
 
 
 def legacy_own_files(outdir: str) -> Set[str]:
@@ -2178,21 +2611,21 @@ def legacy_own_files(outdir: str) -> Set[str]:
         return set()
     if not text.startswith(README_TITLE):
         return set()
-    return set(re.findall(r"\[`([^`]+)`\]\(#", text)) | {"README.md", "colors.tsv"}
+    return {n for n in re.findall(r"\[`([^`]+)`\]\(#", text) if safe_name(n)} | {"README.md", "colors.tsv"}
 
 
 def foreign_columns(outdir: str, names: Iterable[str]) -> Dict[str, str]:
-    """Column names of other tools' tables in OUTDIR (README step 2 loads every .tsv there)."""
+    """Column names of other tools' .tsv tables in OUTDIR (README step 2 loads every .tsv there)."""
     out: Dict[str, str] = {}
     for n in sorted(names):
-        if not n.lower().endswith((".tsv", ".csv")):
+        if not n.lower().endswith(".tsv"):
             continue
         try:
             with open(os.path.join(outdir, n), encoding="utf-8-sig", errors="replace") as fh:
                 head = fh.readline().rstrip("\r\n")
         except OSError:
             continue
-        cells = [c.strip().strip('"') for c in (head.split("\t") if "\t" in head else head.split(","))]
+        cells = [c.strip().strip('"') for c in head.split("\t")]
         if [c.lower() for c in cells[:3]] == ["column", "value", "color"]:
             continue  # a colour key, not a table
         for c in cells:
@@ -2231,16 +2664,20 @@ def input_coverage(paths: List[str], recursive: bool) -> Callable[[str], bool]:
 # Main
 # ============================================================
 
-def collect_inputs(paths: List[str], recursive: bool, outdir: str,
-                   ignored: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+def collect_inputs(paths: List[str], recursive: bool, outdir: str, ignored: Optional[List[str]] = None,
+                   own: Iterable[str] = (), unreadable: Optional[List[Tuple[str, str]]] = None) -> List[Tuple[str, str]]:
     """(path, display name) of every input file; display names are relative to their input folder.
-    Files inside OUTDIR (this script's own outputs) are left out and listed in `ignored`."""
+    In OUTDIR, the files this script wrote (`own`, colors.tsv, README.md, the manifest, temporary files) are left
+    out and listed in `ignored`; other files there are read like any input. While walking a folder that contains
+    OUTDIR, OUTDIR itself is not entered. Folders that cannot be read go to `unreadable` (name, reason)."""
     found, seen = [], set()
     out_real = os.path.realpath(outdir)
+    mine = {n.casefold() for n in own} | RESERVED_FILES
 
     def add(p: str, base: Optional[str] = None) -> None:
         rp = os.path.realpath(p)
-        if rp == out_real or rp.startswith(out_real + os.sep):
+        name = os.path.basename(rp)
+        if os.path.dirname(rp) == out_real and (name.casefold() in mine or name.startswith(".itol2tsv-")):
             if ignored is not None and rp not in ignored:
                 ignored.append(rp)
             return
@@ -2250,7 +2687,11 @@ def collect_inputs(paths: List[str], recursive: bool, outdir: str,
 
     for p in paths:
         if os.path.isdir(p):
-            for root, dirs, files in os.walk(p):
+            def onerror(e: OSError, base: str = p) -> None:
+                if unreadable is not None:
+                    where = os.path.relpath(e.filename, base) if e.filename else "."
+                    unreadable.append((base.rstrip(os.sep) if where == "." else where, e.strerror or str(e)))
+            for root, dirs, files in os.walk(p, onerror=onerror):
                 dirs[:] = sorted(x for x in dirs if not x.startswith(".")
                                  and os.path.realpath(os.path.join(root, x)) != out_real) if recursive else []
                 for name in sorted(files):
@@ -2268,7 +2709,24 @@ def default_outdir(first: str) -> str:
     return os.path.join(base, "mitol_converted")
 
 
+def _interrupted(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    try:  # SIGTERM like Ctrl-C: temporary files are removed and the message says what to do
+        signal.signal(signal.SIGTERM, _interrupted)
+    except ValueError:  # not the main thread
+        pass
+    try:
+        return run(argv)
+    except KeyboardInterrupt:
+        print("\nitol2tsv: interrupted; run the same command again to finish (it replaces what this run wrote)",
+              file=sys.stderr)
+        return 130
+
+
+def run(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog="Example: python3 scripts/itol2tsv.py results/ --tree tree.nwk   "
                                         "(writes results/mitol_converted/)")
@@ -2280,6 +2738,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     outdir = os.path.abspath(args.outdir or default_outdir(args.inputs[0]))
     check_outdir(outdir)
+    # OUTDIR may be shared with other tools: only files its manifest lists are this script's.
+    manifest = read_manifest(outdir) if os.path.isdir(outdir) else {}
+    if manifest is None:
+        sys.exit(f"itol2tsv: {os.path.join(outdir, MANIFEST)} is not a manifest itol2tsv can read; "
+                 "choose another folder with -o")
+    own = set(manifest.get("files", [])) or legacy_own_files(outdir)
+    prev: List[dict] = manifest.get("outputs", [])
+
     tree = None
     if args.tree:
         try:
@@ -2293,10 +2759,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     failed: List[Tuple[str, str]] = []
     report: List[Tuple[str, object]] = []  # (file name, Dataset or "skip"/"FAIL" text), in input order
     ignored: List[str] = []
-    for path, name in collect_inputs(args.inputs, args.recursive, outdir, ignored):
+    unreadable: List[Tuple[str, str]] = []
+    inputs = collect_inputs(args.inputs, args.recursive, outdir, ignored, own, unreadable)
+    for name, why in unreadable:
+        skipped.append((name + "/", f"cannot read folder: {why}"))
+        report.append((name, f"skip  {name}/: cannot read folder: {why}"))
+    for path, name in inputs:
         kind, first = itol_header(path)
         if kind is None:
-            skipped.append((name, f"not an iTOL file (first line: {first[:50]!r})"))
+            skipped.append((name, first))
         elif kind not in CONVERTERS:
             skipped.append((name, f"{kind}: {UNSUPPORTED.get(kind, 'iTOL type not supported by mitol')}"))
         else:
@@ -2306,9 +2777,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 failed.append((name, f"{type(e).__name__}: {e}"))
                 report.append((name, f"FAIL  {name}: {type(e).__name__}: {e}"))
                 continue
-            datasets.append(d)
-            report.append((name, d))
-            continue
+            why = d.unusable()
+            if why is None:
+                datasets.append(d)
+                report.append((name, d))
+                continue
+            skipped.append((name, f"{kind}: {why}"))
         report.append((name, f"skip  {name}: {skipped[-1][1]}"))
     if tree is not None:
         unify_clade_ids(datasets, tree)
@@ -2323,21 +2797,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"ok    {item.display}: {item.kind}, {plural(n_rows(item), 'row')} -> {item.out_file}{cols}")
             for w in item.warnings:
                 print(f"        warning: {render(item, w, quote=chr(39))}")
+            for n in item.renamed:
+                print(f"        note: {n}")
         if ignored:
-            print(f"note: {plural(len(ignored), 'file')} inside the output folder ignored as input")
+            print(f"note: {plural(len(ignored), 'file')} that itol2tsv wrote in the output folder ignored as input")
 
     if not datasets:
         print_report()
-        print(f"itol2tsv: no iTOL dataset converted from {', '.join(args.inputs)}; nothing written", file=sys.stderr)
+        sys.stdout.flush()
+        if ignored and not inputs:
+            print(f"itol2tsv: the inputs are files itol2tsv wrote in {outdir}; give the iTOL files, or choose another "
+                  "folder with -o; nothing written", file=sys.stderr)
+        else:
+            print(f"itol2tsv: no iTOL dataset converted from {', '.join(args.inputs)}; nothing written", file=sys.stderr)
         return 1
 
-    # OUTDIR may be shared with other tools: only files its manifest lists are this script's.
-    manifest = read_manifest(outdir) if os.path.isdir(outdir) else {}
-    if manifest is None:
-        sys.exit(f"itol2tsv: {os.path.join(outdir, MANIFEST)} is not a manifest itol2tsv can read; "
-                 "choose another folder with -o")
-    own = {str(x) for x in manifest.get("files", [])} or legacy_own_files(outdir)
-    prev: List[dict] = manifest.get("outputs", [])
     present = sorted(os.listdir(outdir)) if os.path.isdir(outdir) else []
     own_cf = {x.casefold() for x in own} | {MANIFEST}
     foreign = [n for n in present if n.casefold() not in own_cf and not n.startswith(".itol2tsv-")]
@@ -2347,12 +2821,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                  "lists it); choose another folder with -o")
 
     # Earlier outputs: replaced (source converted again), kept (source not among this run's inputs), or stale
-    # (source gone, or among the inputs but not converted this time).
+    # (source gone, or among the inputs but not converted this time). A version 1 manifest has absolute paths,
+    # which still name the original folder after a copy: there, a source with the same file name as one
+    # converted now counts as replaced.
     covered = input_coverage(args.inputs, args.recursive)
     converted = {os.path.realpath(d.f.path) for d in datasets}
+    reuse = {e["source"]: e["file"] for e in prev}
+    if manifest.get("legacy"):
+        by_name = {os.path.basename(e["source"]): e for e in prev if e["source"] not in converted}
+        for d in datasets:
+            e = by_name.get(os.path.basename(d.f.path))
+            if e is not None and os.path.realpath(d.f.path) not in reuse:
+                reuse[os.path.realpath(d.f.path)] = e["file"]
+                e["replaced"] = True
     carried = []
     for e in prev:
-        if e["source"] in converted or covered(e["source"]) or not os.path.isfile(e["source"]):
+        if e.pop("replaced", False) or e["source"] in converted or covered(e["source"]) or not os.path.isfile(e["source"]):
             continue  # replaced, or stale (its file is removed below)
         if os.path.isfile(os.path.join(outdir, e["file"])):
             carried.append(e)
@@ -2362,13 +2846,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         for c in e.get("columns", []):
             outside.setdefault(c, f"{e['file']} (kept from an earlier run)")
     assign_names(datasets, outside)
-    assign_files(datasets, foreign=foreign, reuse={e["source"]: e["file"] for e in prev}, keep=carried_files)
+    assign_files(datasets, foreign=foreign, reuse=reuse, keep=carried_files)
 
     general = []
     if tree is None and clade_rows_without_tree(datasets):
         general.append("Clade rows ('A|B') in decoration columns: mitol keeps one row per clade, so if two files spell "
                        "the same clade differently ('A|B' and 'C|D'), only the file loaded last counts for it; "
                        "re-run with --tree to write one spelling per clade.")
+    symbols = [f"`{d.col('s0').name}`" for d in datasets if d.kind == "DATASET_SYMBOL"]
+    if len(symbols) > 1:
+        general.append(f"{len(symbols)} files are symbol datasets ({', '.join(symbols)}): add one Leaf markers rule "
+                       "per file; rules sit side by side at the leaf tips in list order (reorder with ▲ ▼).")
 
     produced = [d.out_file for d in datasets]
     produced_cf = {n.casefold() for n in produced}
@@ -2377,10 +2865,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     edited: List[str] = []
     try:
         os.makedirs(outdir, exist_ok=True)
+        for n in os.listdir(outdir):  # temporary files of an interrupted run
+            if n.startswith(".itol2tsv-") and n.endswith(".tmp") and os.path.isfile(os.path.join(outdir, n)):
+                os.remove(os.path.join(outdir, n))
         # Claim the files before writing them, so an interrupted run leaves a folder the next run accepts.
-        claim = sorted(own | set(produced) | set(specials))
-        write_atomic(os.path.join(outdir, MANIFEST),
-                     json.dumps({"tool": "itol2tsv", "version": 1, "files": claim, "outputs": prev}, indent=1) + "\n")
+        write_atomic(os.path.join(outdir, MANIFEST), manifest_text(own | set(produced) | set(specials), prev, outdir))
         entries = []
         for d in datasets:
             text = dataset_text(d)
@@ -2400,14 +2889,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 continue
             os.remove(p)
             removed.append(n)
-        rows = [r for e in entries + carried for r in e.get("colors", [])]
-        write_atomic(os.path.join(outdir, "colors.tsv"), table_text(["column", "value", "color"], rows))
+        rows = [(list(r) + [""])[:4] for e in entries + carried for r in e.get("colors", [])]
+        write_atomic(os.path.join(outdir, "colors.tsv"), table_text(["column", "value", "color", "shape"], rows))
         write_atomic(os.path.join(outdir, "README.md"),
                      readme_text(entries, carried, skipped, failed, args.inputs, args.tree, general))
-        files = sorted(set(produced) | set(carried_files) | set(specials))
-        write_atomic(os.path.join(outdir, MANIFEST),
-                     json.dumps({"tool": "itol2tsv", "version": 1, "files": files, "outputs": entries + carried},
-                                indent=1) + "\n")
+        files = set(produced) | set(carried_files) | set(specials)
+        write_atomic(os.path.join(outdir, MANIFEST), manifest_text(files, entries + carried, outdir))
     except OSError as e:
         sys.exit(f"itol2tsv: cannot write to {outdir}: {e.strerror or e}")
 
@@ -2418,7 +2905,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"removed {n} (made earlier; its source is gone or did not convert this time)")
     for n in edited:
         print(f"note: {n} was edited after itol2tsv wrote it: left in place, no longer managed by itol2tsv")
-    if tree is None and any("--tree" in w for d in datasets for w in d.warnings):
+    if tree is None and any(d.unexpanded for d in datasets):
         print("note: some files have clade rows ('A|B') or CONTAINS== patterns; pass --tree to expand them to leaves")
     for g in general:
         print(f"note: {g}")
