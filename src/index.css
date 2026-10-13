@@ -692,3 +692,15 @@ select {
   flex-shrink: 0;
   background: linear-gradient(90deg, #e15759, #edc948, #59a14f, #4e79a7);
 }
+
+/* Leaf marker rule (Tree decorations) */
+.marker-rule {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  margin-bottom: 6px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #fff;
+}

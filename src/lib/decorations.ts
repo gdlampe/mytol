@@ -1,6 +1,74 @@
 import type { AnnotationRow, Tree } from "./types";
 import type { ShapeKind } from "./rings/band";
 
+/**
+ * Leaf markers: leaves (and A|B clade rows) matching a rule get a symbol at
+ * their tip. Rules stack outward in list order, like iTOL symbol datasets.
+ */
+export type MarkerRule = {
+  id: string;
+  /** Column tested (null = every leaf). */
+  column: string | null;
+  /** any = has a value; is / not = one of `values`; gte / lte / between = numbers a (, b). */
+  op: "any" | "is" | "not" | "gte" | "lte" | "between";
+  values: string[];
+  a: number | null;
+  b: number | null;
+  /** Shape for every match, unless shapeByValue: one shape per value (from `shapes`, a colour key, or a default cycle). */
+  shape: ShapeKind;
+  shapeByValue: boolean;
+  shapes: Record<string, ShapeKind>;
+  /** Fixed colour, or null = the column's colours (category colours / numeric ring gradient). */
+  color: string | null;
+  size: number;
+  filled: boolean;
+  /** Legend title (blank = the column name). */
+  label: string;
+  visible: boolean;
+};
+
+export const newMarkerRule = (column: string | null): MarkerRule => ({
+  id: `m${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`,
+  column, op: "any", values: [], a: null, b: null,
+  shape: "circle", shapeByValue: false, shapes: {}, color: null,
+  size: 8, filled: true, label: "", visible: true,
+});
+
+/** Does a row satisfy a marker rule? */
+export function markerMatches(rule: MarkerRule, row: AnnotationRow | undefined): boolean {
+  if (!rule.column) return !!row || rule.op === "any";
+  const raw = row?.[rule.column];
+  const v = raw === null || raw === undefined ? "" : String(raw).trim();
+  switch (rule.op) {
+    case "any": return v !== "";
+    case "is": return v !== "" && rule.values.includes(v);
+    case "not": return v !== "" && !rule.values.includes(v);
+    default: {
+      if (v === "") return false;
+      const n = Number(v);
+      if (!Number.isFinite(n)) return false;
+      const a = rule.a ?? -Infinity, b = rule.b ?? Infinity;
+      if (rule.op === "gte") return n >= a;
+      if (rule.op === "lte") return n <= a;
+      return n >= Math.min(a, b) && n <= Math.max(a, b);
+    }
+  }
+}
+
+/** iTOL symbol codes (1 square … 6 check) or shape names → a shape, else null. */
+export function parseShape(s: string | undefined | null): ShapeKind | null {
+  const t = (s ?? "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  const codes: Record<string, ShapeKind> = { "1": "square", "2": "circle", "3": "star", "4": "triangle-right", "5": "triangle-left", "6": "check" };
+  if (codes[t]) return codes[t];
+  const names: Record<string, ShapeKind> = {
+    square: "square", rectangle: "square", box: "square", circle: "circle", dot: "circle", star: "star",
+    triangle: "triangle-up", "triangle-up": "triangle-up", "triangle-down": "triangle-down",
+    "triangle-right": "triangle-right", "triangle-left": "triangle-left", "right-triangle": "triangle-right", "left-triangle": "triangle-left",
+    check: "check", checkmark: "check", diamond: "diamond", hexagon: "hexagon", octagon: "octagon", plus: "plus", cross: "cross",
+  };
+  return names[t] ?? null;
+}
+
 // ============================================================
 // Tree decorations driven by annotation columns (iTOL TREE_COLORS /
 // DATASET_STYLE / LABELS / DATASET_SYMBOL / DATASET_PIECHART /
@@ -37,6 +105,8 @@ export type TreeDecor = {
   connOpacity: number;
   connArrows: boolean;
   connCurve: "root" | "center" | "straight";
+  /** Leaf markers (rules, drawn in order outward from the tip). */
+  markers: MarkerRule[];
 };
 
 export const DEFAULT_DECOR: TreeDecor = {
@@ -61,6 +131,7 @@ export const DEFAULT_DECOR: TreeDecor = {
   connOpacity: 0.6,
   connArrows: false,
   connCurve: "root",
+  markers: [],
 };
 
 /** Lowest common ancestor of two nodes (via L/R leaf intervals). */

@@ -71,8 +71,9 @@ import {
   nodeNameIndex,
   resolveNodeRef,
 } from "../lib/decorations";
-import type { TreeDecor } from "../lib/decorations";
-import { FIELD_PALETTE } from "../lib/rings/util";
+import type { TreeDecor, MarkerRule } from "../lib/decorations";
+import { newMarkerRule, markerMatches, parseShape } from "../lib/decorations";
+import { FIELD_PALETTE, DEFAULT_SHAPES } from "../lib/rings/util";
 import {
   NO_VALUE,
   cellValue,
@@ -101,7 +102,9 @@ import { canvasBand, svgBand } from "../lib/rings/band";
 import type { BandOut } from "../lib/rings/band";
 import type { RingKind, Slot } from "../lib/rings/types";
 import { SHAPE_CHOICES } from "../lib/rings/types";
+import type { ShapeKind } from "../lib/rings/band";
 import AddRingForm from "./AddRingForm";
+import MarkerRuleEditor from "./MarkerRuleEditor";
 import { RING_MODULES, isColumnRing, ringModule, ringWidth } from "../lib/rings";
 
 // ============================================================
@@ -1098,6 +1101,56 @@ export default function Phylo() {
     return (row) => paint(row)?.color ?? null;
   };
 
+  // ---- Leaf markers ----
+  // Shapes given in colour keys (shape column), by column and value.
+  const colorKeyShapes = useMemo(() => {
+    const m = new Map<string, Map<string, ShapeKind>>();
+    for (const f of colorKeyFiles) for (const e of f.entries) {
+      const sh = parseShape(e.shape);
+      if (!sh) continue;
+      if (!m.has(e.column)) m.set(e.column, new Map());
+      m.get(e.column)!.set(e.value, sh);
+    }
+    return m;
+  }, [colorKeyFiles]);
+  // Leaves and clade rows matching each rule (with their value), in leaf order.
+  const markerHits = useMemo(() => {
+    const out = new Map<string, Array<{ id: number; value: string }>>();
+    if (!tree) return out;
+    for (const rule of decor.markers) {
+      const hits: Array<{ id: number; value: string }> = [];
+      const test = (id: number, row: AnnotationRow | undefined) => {
+        if (!markerMatches(rule, row)) return;
+        const v = rule.column ? row?.[rule.column] : "";
+        hits.push({ id, value: v === null || v === undefined ? "" : String(v).trim() });
+      };
+      for (const id of tree.leaves) test(id, annotations.get(tree.nodes[id].name || ""));
+      if (rule.column) for (const [id, row] of internalRows) test(id, row);
+      out.set(rule.id, hits);
+    }
+    return out;
+  }, [tree, annotations, internalRows, decor.markers]);
+  /** Marker shape for a value: the rule's shape, or per value (rule → colour key → a default cycle). */
+  const markerShape = (rule: MarkerRule, value: string): ShapeKind => {
+    if (!rule.shapeByValue) return rule.shape;
+    const given = rule.shapes[value] ?? (rule.column ? colorKeyShapes.get(rule.column)?.get(value) : undefined);
+    if (given) return given;
+    const cats = rule.column ? [...(colorMaps.get(rule.column)?.keys() ?? [])] : [];
+    const i = Math.max(0, cats.indexOf(value));
+    return DEFAULT_SHAPES[i % DEFAULT_SHAPES.length];
+  };
+  const markerColor = (rule: MarkerRule): ((row: AnnotationRow | undefined) => string) => {
+    if (rule.color) return () => rule.color!;
+    const fn = rule.column ? columnColorFn(rule.column) : null;
+    return (row) => fn?.(row) ?? "#333333";
+  };
+  /** Values a rule's leaves carry, in category order (legend, per-value shape list). */
+  const markerValues = (rule: MarkerRule): string[] => {
+    const present = new Set((markerHits.get(rule.id) ?? []).map(h => h.value).filter(v => v !== ""));
+    const order = rule.column ? [...(colorMaps.get(rule.column)?.keys() ?? [])] : [];
+    return [...order.filter(v => present.has(v)), ...[...present].filter(v => !order.includes(v))];
+  };
+
   // Branch colours by column (null = not set).
   const decorBranchColors = useMemo(() => {
     if (!tree || !decor.branchColorBy) return null;
@@ -1289,6 +1342,29 @@ export default function Phylo() {
         : [{ id: `${sid}\x00all`, label: text(`${sid}\x00all`, colLabel(decor.symbolBy)), color: "#333", fillAlpha: 1, shape: decor.symbolShape, hollow: !decor.symbolFilled }];
       sections.push({ id: sid, title: text(sid, colLabel(decor.symbolBy)), kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder[sid]), more: 0 });
     }
+    // Leaf markers: one section per visible rule.
+    for (const rule of decor.markers) {
+      if (!rule.visible || !(markerHits.get(rule.id)?.length)) continue;
+      const sid = `decor:marker:${rule.id}`;
+      const title = text(sid, rule.label || (rule.column ? colLabel(rule.column) : "Leaf markers"));
+      const ring = rule.column ? columnRings.find(t => t.key === rule.column) : undefined;
+      if (!rule.color && ring && ring.type === "continuous") {
+        const cs = { ...contStyle(ring), mode: "gradient" as const };
+        const sc = makeValueScale(cs, numStats.get(ring.key));
+        const { lo, hi } = scaleLabel(sc);
+        sections.push({ id: sid, title, kind: "ramp", min: lo, max: hi, style: "gradient", color: cs.barColor,
+          stops: cs.stops.map(color => ({ color, opacity: 1 })), ticks: scaleTicks(sc) });
+        continue;
+      }
+      const byValue = rule.column && (rule.shapeByValue || !rule.color);
+      const cmap = rule.column ? colorMaps.get(rule.column) : undefined;
+      const entries: LegendEntry[] = byValue
+        ? markerValues(rule).map(v => ({ id: `${sid}\x00${v}`, label: text(`${sid}\x00${v}`, v), color: rule.color ?? cmap?.get(v) ?? "#333333",
+            fillAlpha: 1, shape: markerShape(rule, v), hollow: !rule.filled }))
+        : [{ id: `${sid}\x00all`, label: text(`${sid}\x00all`, rule.label || (rule.column ? colLabel(rule.column) : "Marked leaves")),
+            color: rule.color ?? "#333333", fillAlpha: 1, shape: rule.shape, hollow: !rule.filled }];
+      sections.push({ id: sid, title, kind: "swatches", entries: applyOrder(entries, e => e.id, legendEntryOrder[sid]), more: 0 });
+    }
     // Node pies: one swatch per field.
     if (decor.pieFields.length) {
       const sid = "decor:pies";
@@ -1312,7 +1388,7 @@ export default function Phylo() {
   }, [
     tree, legendLabels, legendOnlyPresent, legendOrder, legendEntryOrder,
     showTracks, trackConfig, colorMaps, presentCategories, numStats, annotationRows, columnRings,
-    decor.symbolBy, decor.symbolShape, decor.symbolFilled, decor.pieFields,
+    decor.symbolBy, decor.symbolShape, decor.symbolFilled, decor.pieFields, decor.markers, markerHits, colorKeyShapes,
     ranges, rangeDisplayMode, rangeOpacity,
     optSupportColouring, treeHasSupport, supportAsPercent,
     supportC0, supportC1, supportC2, supportV0, supportV1, supportV2,
@@ -1566,6 +1642,43 @@ export default function Phylo() {
       }
       out.flush();
     }
+
+    // Leaf markers: each visible rule further out from the tip (rect: to the right;
+    // circular: away from the centre; unrooted: along the leaf's branch).
+    let markerOffset = 2;
+    for (const rule of decor.markers) {
+      if (!rule.visible) continue;
+      const hits = markerHits.get(rule.id) ?? [];
+      const size = rule.size;
+      const o = markerOffset + size / 2;
+      markerOffset += size + 2;
+      if (!hits.length) continue;
+      const colorOf = markerColor(rule);
+      const cell = Math.max(2, size * 0.9);
+      const seen = new Set<number>();
+      for (const h of hits) {
+        const id = shown(h.id);
+        if (id === null) continue;
+        const p = nodeScreen(id);
+        if (!p) continue;
+        let dir: [number, number] = [1, 0];
+        if (mode !== "rect") {
+          const par = layout === "unrooted" && tree.nodes[id].parent !== null ? nodeScreen(tree.nodes[id].parent!) : null;
+          dir = par ? [p[0] - par[0], p[1] - par[1]] : [p[0] - center[0], p[1] - center[1]];
+          const dl = Math.hypot(dir[0], dir[1]) || 1;
+          dir = [dir[0] / dl, dir[1] / dl];
+        }
+        const q: [number, number] = [p[0] + dir[0] * o, p[1] + dir[1] * o];
+        if (!onScreen(q, size)) continue;
+        const key = Math.floor(q[0] / cell) * 100003 + Math.floor(q[1] / cell);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const color = colorOf(nodeRow(h.id));
+        out.shape(markerShape(rule, h.value), q[1], q[0], size, rule.filled ? color : null,
+          rule.filled ? "rgba(0,0,0,0.45)" : color, rule.filled ? 0.5 : 1.5);
+      }
+      out.flush();
+    }
   }
 
   function drawDecorations(
@@ -1574,7 +1687,7 @@ export default function Phylo() {
     leafFrom: number, leafTo: number, leafPx: number
   ) {
     void skipNode;
-    if (!decor.symbolBy && !decor.pieFields.length && !(decor.connShow && resolvedConnections.length)) return;
+    if (!decor.symbolBy && !decor.pieFields.length && !(decor.connShow && resolvedConnections.length) && !decor.markers.some(r => r.visible)) return;
     const out = canvasBand(ctx, { kind: "rect", x0: 0 });
     renderDecorations(out, (p, q, cp, color, width, dashed, alpha, cp2) => {
       ctx.save();
@@ -2748,7 +2861,7 @@ export default function Phylo() {
     annMatches, annHighlight, annHighlightColor, annStepTargets, annDotSize,
     legendModel, legendPos, legendFontSize, legendColumns, legendBox,
     viewSize, nodeSupport, supportLabelsAll,
-    rangeOpacity, rangeExtend, rangeRound, optBranchColor,
+    rangeOpacity, rangeExtend, rangeRound, optBranchColor, markerHits, colorKeyShapes, colorMaps,
   ]);
 
   // ==========================================================
@@ -5827,6 +5940,35 @@ export default function Phylo() {
                   {columnChoices.filter(c => c.numeric).map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
                 </select>
               </div>
+
+              <div className="note decor-heading">Leaf markers</div>
+              <div className="note" style={{ marginBottom: 4 }}>Symbols at the tips of the leaves (or clade rows) that match a rule; each rule sits further out.</div>
+              {decor.markers.map((rule, idx) => (
+                <MarkerRuleEditor
+                  key={rule.id}
+                  rule={rule}
+                  index={idx}
+                  count={decor.markers.length}
+                  columns={columnChoices}
+                  categories={rule.column ? [...(colorMaps.get(rule.column)?.keys() ?? [])] : []}
+                  shownValues={markerValues(rule)}
+                  shapeOf={(v) => markerShape(rule, v)}
+                  colorOf={(v) => rule.color ?? (rule.column ? colorMaps.get(rule.column)?.get(v) : undefined) ?? "#333333"}
+                  matches={markerHits.get(rule.id)?.length ?? 0}
+                  onChange={(patch) => patchDecor({ markers: decor.markers.map(r => (r.id === rule.id ? { ...r, ...patch } : r)) })}
+                  onRemove={() => patchDecor({ markers: decor.markers.filter(r => r.id !== rule.id) })}
+                  onMove={(dir) => {
+                    const j = idx + dir;
+                    if (j < 0 || j >= decor.markers.length) return;
+                    const next = [...decor.markers];
+                    [next[idx], next[j]] = [next[j], next[idx]];
+                    patchDecor({ markers: next });
+                  }}
+                  editColor={(title, color, apply) => setColorEdit({ title, color, apply })}
+                />
+              ))}
+              <button type="button" className="btn" style={{ marginBottom: 4 }}
+                onClick={() => patchDecor({ markers: [...decor.markers, newMarkerRule(columnChoices.find(c => !c.numeric)?.key ?? null)] })}>+ Add marker rule</button>
 
               <div className="note decor-heading">Node symbols</div>
               <div className="style-row">

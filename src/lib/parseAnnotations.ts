@@ -31,7 +31,8 @@ export type Connection = {
   label?: string;
 };
 
-export type ColorKeyEntry = { column: string; value: string; color: string };
+/** Colour-key row; `shape` (optional column: iTOL code 1–6 or a name) is used by leaf markers. */
+export type ColorKeyEntry = { column: string; value: string; color: string; shape?: string };
 
 export type ParsedAnnotationFile =
   | { kind: "table"; rows: AnnotationRow[]; columns: string[]; note?: string }
@@ -105,12 +106,14 @@ export function parseAnnotationText(text: string, fileName: string): ParsedAnnot
   // Colour key: column / value / color, and no id column.
   const keyCol = findCol(cols, ["column"]), valCol = findCol(cols, ["value"]), colorCol = findCol(cols, ["color", "colour"]);
   if (keyCol && valCol && colorCol && !findCol(cols, ["id", "name"])) {
+    const shapeCol = findCol(cols, ["shape"]);
     const entries: ColorKeyEntry[] = [];
     let skipped = 0;
     for (const r of parsed) {
       const column = (r[keyCol] ?? "").trim(), value = (r[valCol] ?? "").trim();
       const color = normalizeColor(r[colorCol] ?? "");
-      if (column && color) entries.push({ column, value, color });
+      const shape = shapeCol ? (r[shapeCol] ?? "").trim() : "";
+      if (column && color) entries.push(shape ? { column, value, color, shape } : { column, value, color });
       else if (column || value) skipped++;
     }
     return { kind: "colors", entries, skipped };
