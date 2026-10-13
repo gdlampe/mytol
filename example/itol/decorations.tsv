@@ -1,0 +1,43 @@
+id	branch_color	branch_width	label_color	label_background	label_style	display_name	pie_ltr	pie_non_ltr	pie_group_ii	pie_ug_abi	pie_other	node_symbol
+A0A5S6Q2M3		3	non-LTR	highlight	bold	nonLTR-02 representative						characterised
+A0A895KUH0		3	Retroplasmid		italic	Rplasmid-01 representative						characterised
+A0A7U1BF81		3	GII intron		bold-italic	GII-02 representative						characterised
+A0A347UQ58		3	G2L/CRISPR	highlight	bold	G2L-01 representative						characterised
+A0A5C7WAV5		3	DGRs		italic	DGR-02 representative						characterised
+A0A543KIP3		3	UG4		bold-italic	UG4-01 representative						characterised
+A0A521FA38		3	UG39	highlight	bold	UG39-01 representative						characterised
+A0A3G3IGV0		3	UG26		italic	UG26-01 representative						characterised
+J7SF03		3	TERT		bold-italic	TERT-02 representative						characterised
+A0A7M3PTT3		3	PLE	highlight	bold	PLE-01 representative						characterised
+A0A5A7MHU1		3	UG17		italic	UG17-01 representative						characterised
+A0A378R0U2		3	UG3		bold-italic	UG3-01 representative						characterised
+A0A662ZED9		3	UG2	highlight	bold	UG2-01 representative						characterised
+A0A5C9A4V7		3	Class 3 UG/Abi		italic	Abi3-01 representative						characterised
+A0A6L5H9Q9		3	Class 1 UG/Abi		bold-italic	Abi1-06 representative						characterised
+A0A2W4WEA3		3	UG36	highlight	bold	UG36-01 representative						characterised
+A0A6H2D3B1		3	retron		italic	Retron-01 representative						characterised
+A0A3L8DG69		3	LTR/Retroviral/YR		bold-italic	LTR-20 representative						characterised
+A0A6U3JU95|A0A812LX55	non-LTR	2										weak_support
+C5K8E4|Q54DH4	non-LTR	2										strong_support
+L1JC59|V6LZP4	non-LTR	2										strong_support
+A0A495Z8W2|A0A1Y1Q1Q0	GII intron	2										weak_support
+A0A4U1A0B9|A0A1M7YGE5	GII intron	2										strong_support
+T1B4R9|A0A495ZKL8	G2L/CRISPR	2										weak_support
+A0A377J340|A0A1S6HHE2	DGRs	2										strong_support
+A0A7T9QB54|I4B0C5	G2L/CRISPR	2										weak_support
+A0A068YH80|O45321	TERT	2										weak_support
+A0A212IVW5|A0A150WM62	UG17	2										weak_support
+A0A845FBP8|A0A519PQX9	UG3	2										strong_support
+A0A0N0UYT8|G0VNL5	UG2	2										strong_support
+A0A0F9LBG8|A0A1G7TSI4	Class 3 UG/Abi	2										weak_support
+A0A7Z8GYG8|A0A417IKX4	Class 1 UG/Abi	2										weak_support
+A0A4R1D371|A0A1F6W4H6	retron	2										strong_support
+A0A151PAZ2|A0A7J6U7G0	LTR/Retroviral/YR	2										strong_support
+A0A3N1LK92|A0A838N6K7	non-LTR	2										weak_support
+L1JC59|A0A838N6K7							2203	1385	534	925	1048	weak_support
+L1JC59|A0A023AW47							2203	86	534	925	1048	weak_support
+A0A369T7D5|A0A3D4PF71							0	0	534	925	434	strong_support
+A0A849WI53|K2DQF9							0	0	104	925	423	weak_support
+A0A2E3MUH7|K2DQF9							0	0	44	925	214	weak_support
+A0A068YH80|A0A0G1VV23							0	0	0	176	198	weak_support
+A0A7L9CWU9|A0A7J6U7G0							2203	0	0	0	614	weak_support

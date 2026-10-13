@@ -1,0 +1,28 @@
+source	target	weight	width	color	style	label
+A0A4R1D371|A0A1F6W4H6	A0A7Z8GYG8|A0A417IKX4	8		#e15759	solid	shared_effector
+A0A4R1D371|A0A1F6W4H6	A0A377J340|A0A1S6HHE2	5		#e15759	dashed	shared_ncrna
+A0A4U1A0B9|A0A1M7YGE5	T1B4R9|A0A495ZKL8	10		#4e79a7	solid	group_ii_like
+T1B4R9|A0A495ZKL8	A0A845FBP8|A0A519PQX9	3		#4e79a7	dashed	group_ii_like
+A0A151PAZ2|A0A7J6U7G0	A0A3N1LK92|A0A838N6K7	6		#59a14f	solid	retrotransposon
+A0A068YH80|O45321	A0A3N1LK92|A0A838N6K7	4		#59a14f	dashed	retrotransposon
+A0A0N0UYT8|G0VNL5	A0A0F9LBG8|A0A1G7TSI4	2		#b07aa1	dashed	abi_like
+A0A845FBP8|A0A519PQX9	A0A7Z8GYG8|A0A417IKX4	7		#b07aa1	solid	abi_like
+A0A7G7G6H4	A0A1D2QZP3	4		#9c755f	solid	paralog_pair
+A0A0M2UZ45	A0A560BQT3	4		#9c755f	solid	paralog_pair
+A0A081NJ02	A0A644XH96	2		#9c755f	solid	paralog_pair
+A0A3D0WR64	A0A1H3XCK8	5		#9c755f	solid	paralog_pair
+A0A7C4FU34	A0A6M5YKV4	2		#9c755f	solid	paralog_pair
+A0A517QEG1	A0A661T406	5		#9c755f	solid	paralog_pair
+A0A418Y4U6	R9JIE9	4		#9c755f	solid	paralog_pair
+A0A6I5ZWE8	A0A0S2LPX6	5		#9c755f	solid	paralog_pair
+A0A1Y3EL04	A0A7S0VXP3	3		#9c755f	solid	paralog_pair
+E4X8D3	A0A2I0XJJ4	4		#9c755f	solid	paralog_pair
+A0A0F8CX36	A0A2P2IAG7	4		#9c755f	solid	paralog_pair
+A0A2B4RWY6	A0A6L2J1P3	3		#9c755f	solid	paralog_pair
+A0A812YRY2	A0A4V2JX17	4		#9c755f	solid	paralog_pair
+A0A2A4T2K0	A0A2S8FQC8	4		#9c755f	solid	paralog_pair
+A0A1M4SXX9	A0A2E5VCH6	4		#9c755f	solid	paralog_pair
+A0A068YH80|O45321	A0A151PAZ2|A0A7J6U7G0		3		solid	default_colour_wide
+A0A377J340---A0A1S6HHE2	A0A0N0UYT8|G0VNL5		1		dashed	default_colour_thin
+A0A6H2D3B1	A0A895KUH0		2		solid	default_colour
+A0A6H2D3B1	A0A6H2D3B1		2		solid	self_loop

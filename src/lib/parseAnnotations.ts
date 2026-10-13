@@ -226,8 +226,10 @@ function parseConnections(parsed: d3.DSVRowArray<string>, src: string, tgt: stri
   for (const r of parsed) {
     const source = (r[src] ?? "").toString().trim(), target = (r[tgt] ?? "").toString().trim();
     if (!source || !target) continue;
-    const w = widthCol ? Number(r[widthCol]) : NaN;
-    const wt = weightCol ? Number(r[weightCol]) : NaN;
+    // Blank cells are "not given", not 0.
+    const num = (c: string | undefined) => (c && String(r[c] ?? "").trim() !== "" ? Number(r[c]) : NaN);
+    const w = num(widthCol);
+    const wt = num(weightCol);
     const style = styleCol ? lc(r[styleCol] ?? "") : "";
     out.push({
       source, target,
