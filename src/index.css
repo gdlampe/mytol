@@ -703,4 +703,34 @@ select {
   border: 1px solid #ddd;
   border-radius: 4px;
   background: #fff;
+
+/* Warning over the canvas (e.g. rings in the unrooted layout); not part of exports */
+.canvas-warning {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 15;
+  max-width: min(560px, calc(100% - 32px));
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: #5c3b00;
+  background: #fff4d6;
+  border: 1px solid #e8c36a;
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+}
+.canvas-warning .btn { padding: 0 6px; flex-shrink: 0; }
+.warn-note {
+  font-size: 12px;
+  line-height: 1.35;
+  color: #5c3b00;
+  background: #fff4d6;
+  border: 1px solid #e8c36a;
+  border-radius: 4px;
+  padding: 5px 7px;
 }
