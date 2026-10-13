@@ -412,6 +412,8 @@ export default function Phylo() {
   const [rangeOpacity, setRangeOpacity] = useState(0.33);
   const [rangeExtend, setRangeExtend] = useState(0);
   const [rangeRound, setRangeRound] = useState(0);
+  // Background ranges drawn behind the branches (default) or in front of them.
+  const [rangeInFront, setRangeInFront] = useState(false);
   // Default branch colour (where no range or support colour applies).
   const [optBranchColor, setOptBranchColor] = useState("#333333");
   // Coloured Ranges → "From a column": collapse / colour every uniform clade of a column.
@@ -1538,8 +1540,8 @@ export default function Phylo() {
     // ---- Per-layout draw functions ----
 
     function drawRectLayout() {
-      // Coloured ranges (background mode only)
-      for (const r of ranges) {
+      // Coloured ranges (background mode only): behind the branches, or after them when "In front".
+      const paintRanges = () => { for (const r of ranges) {
         if (rangeDisplayMode !== "background") continue;
         const nd = nodes[r.nodeId];
         if (!nd) continue;
@@ -1550,7 +1552,8 @@ export default function Phylo() {
         const y1 = cy + vZoom * (-H / 2 + PADDING + sy * nd.L);
         const y2 = cy + vZoom * (-H / 2 + PADDING + sy * (nd.R - 1) + sy);
         fillScreenPolygon(ctx, rectRangeShape(xNode, y1, cx + trackRightEdgeX, y2, rangeExtend, rangeRound), r.color, rangeOpacity);
-      }
+      } };
+      if (!rangeInFront) paintRanges();
 
       for (const nd of nodes) {
         if (skipNode[nd.id] === 2) continue;
@@ -1627,6 +1630,7 @@ export default function Phylo() {
         }
       }
 
+      if (rangeInFront) paintRanges();
     }
     // Tracks and labels for rect layout are drawn as screen-space overlays after ctx.restore().
 
@@ -1640,8 +1644,8 @@ export default function Phylo() {
         W, H, { coords: rectCoords as any[], maxX: rectMaxX }, R, N, effectiveTrackWidth
       );
 
-      // Coloured ranges (background mode only)
-      for (const r of ranges) {
+      // Coloured ranges (background mode only): behind the branches, or after them when "In front".
+      const paintRanges = () => { for (const r of ranges) {
         if (rangeDisplayMode !== "background") continue;
         const nd = nodes[r.nodeId];
         const a0 = (startAngleDeg * Math.PI) / 180 - (nd.L / N) * ((arcDeg * Math.PI) / 180);
@@ -1650,7 +1654,8 @@ export default function Phylo() {
         const rNode = rectToPolar(rectMaxX > 0 ? aRect.x / rectMaxX : 0, aRect.y, N, R, startAngleDeg, arcDeg).radius;
         const shape = sectorRangeShape(W / 2 + offset.x, H / 2 + offset.y, Math.max(0, rNode) * gZoom, trackOuterRadius * gZoom, a0, a1, rangeExtend, rangeRound);
         fillScreenPolygon(ctx, shape, r.color, rangeOpacity);
-      }
+      } };
+      if (!rangeInFront) paintRanges();
 
       // Root dot
       ctx.fillStyle = "#000";
@@ -1764,6 +1769,7 @@ export default function Phylo() {
           ctx.restore();
         }
       }
+      if (rangeInFront) paintRanges();
     }
 
     function drawUnrootedLayout() {
@@ -1778,6 +1784,10 @@ export default function Phylo() {
 
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
+
+      // Coloured ranges: behind the branches, or after them (end of this function) when "In front".
+      const paintRanges = () => drawUnrootedRanges(R, anglePerLeaf, trackOuterRingR);
+      if (!rangeInFront) paintRanges();
 
       // Edges
       for (const nd of nodes) {
@@ -1930,7 +1940,12 @@ export default function Phylo() {
         }
       }
 
-      // Coloured hull ranges (background mode only)
+      if (rangeInFront) paintRanges();
+    }
+
+    function drawUnrootedRanges(R: number, anglePerLeaf: number, trackOuterRingR: number) {
+      if (!unrootedLayout) return;
+      const { coords } = unrootedLayout;
       for (const r of ranges) {
         if (rangeDisplayMode !== "background") continue;
         const nd = nodes[r.nodeId];
@@ -2329,7 +2344,7 @@ export default function Phylo() {
     annMatches, annHighlight, annHighlightColor, annStepTargets, annDotSize,
     legendModel, legendPos, legendFontSize, legendColumns, legendBox,
     viewSize, nodeSupport, supportLabelsAll,
-    rangeOpacity, rangeExtend, rangeRound, optBranchColor,
+    rangeOpacity, rangeExtend, rangeRound, rangeInFront, optBranchColor,
   ]);
 
   // ==========================================================
@@ -3180,7 +3195,10 @@ export default function Phylo() {
       rangeBranch.get(id) ?? (optSupportColouring && nodeSupport[id] !== undefined ? supportColor(nodeSupport[id]!) : optBranchColor);
 
     // Background ranges: one filled path per range (the on-screen shape), named after the range.
-    const svgRanges = (out: string[], shapeOf: (r: ColoredRange) => [number, number][] | null, fmt: (n: number) => string, escape: (s: string) => string) => {
+    // "In front": held back and written after the branches (frontRanges).
+    const frontRanges: string[] = [];
+    const svgRanges = (to: string[], shapeOf: (r: ColoredRange) => [number, number][] | null, fmt: (n: number) => string, escape: (s: string) => string) => {
+      const out = rangeInFront ? frontRanges : to;
       out.push('<g id="coloured-ranges">');
       ranges.forEach((r, i) => {
         if (!tree.nodes[r.nodeId]) return;
@@ -3285,6 +3303,7 @@ export default function Phylo() {
       const swH = f(lw / vZoom);
       for (const [color, paths] of hPaths) lines.push(`<path stroke="${color}" stroke-width="${swH}" fill="none" d="${paths.join(" ")}"/>`);
       lines.push('</g>');
+      lines.push(...frontRanges.splice(0));
 
       // Annotation tracks with same LOD as canvas
       if (showTracks && effectiveTrackW > 0) {
@@ -3395,6 +3414,7 @@ export default function Phylo() {
       lines.push('<g id="branches">');
       for (const [color, paths] of bPaths) lines.push(`<path stroke="${color}" stroke-width="${f(lw)}" fill="none" d="${paths.join(" ")}"/>`);
       lines.push('</g>');
+      lines.push(...frontRanges.splice(0));
 
       // Annotation tracks — annular arc segments (matches canvas, supports optBarFill)
       if (showTracks) {
@@ -3507,6 +3527,7 @@ export default function Phylo() {
       lines.push('<g id="branches">');
       for (const [color, paths] of bPaths) lines.push(`<path stroke="${color}" stroke-width="${f(lw)}" fill="none" d="${paths.join(" ")}"/>`);
       lines.push('</g>');
+      lines.push(...frontRanges.splice(0));
 
       // Annotation ring — arc segments, LOD-thinned, batched by colour
       if (showTracks) {
@@ -3673,7 +3694,7 @@ export default function Phylo() {
       collapsedFingerprints: [...collapsedNodes].map((id) => nodeToFingerprint(tree, id)),
       ranges: ranges.map((r) => ({ fp: nodeToFingerprint(tree, r.nodeId), color: r.color, label: r.label })),
       rangeDisplayMode, rangeColorTrackKey,
-      rangeStyle: { opacity: rangeOpacity, extend: rangeExtend, round: rangeRound },
+      rangeStyle: { opacity: rangeOpacity, extend: rangeExtend, round: rangeRound, inFront: rangeInFront },
       hiddenLeafNames: [...hiddenLeafNames],
       selectedFingerprint: selectedNode !== null && tree.nodes[selectedNode] ? nodeToFingerprint(tree, selectedNode) : null,
       search: {
@@ -3771,6 +3792,7 @@ export default function Phylo() {
         setRangeOpacity(typeof s.rangeStyle?.opacity === "number" ? s.rangeStyle.opacity : 0.33);
         setRangeExtend(typeof s.rangeStyle?.extend === "number" ? s.rangeStyle.extend : 0);
         setRangeRound(typeof s.rangeStyle?.round === "number" ? s.rangeStyle.round : 0);
+        setRangeInFront(!!s.rangeStyle?.inFront);
         if (s.rangeColorTrackKey !== undefined) setRangeColorTrackKey(s.rangeColorTrackKey);
         if (s.search) {
           const q = s.search;
@@ -4455,6 +4477,13 @@ export default function Phylo() {
                     <span className="note" style={{ minWidth: 40, textAlign: "right" }}>{fmt(val)}</span>
                   </div>
                 ))}
+                <div className="style-row">
+                  <span className="note">Layer</span>
+                  <div className="toggle-pill">
+                    <button type="button" className={!rangeInFront ? "active" : ""} onClick={() => setRangeInFront(false)}>Behind branches</button>
+                    <button type="button" className={rangeInFront ? "active" : ""} onClick={() => setRangeInFront(true)}>In front</button>
+                  </div>
+                </div>
               </div>
             )}
             {trackConfig.some(t => t.type === "categorical") && (
