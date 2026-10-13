@@ -2311,6 +2311,44 @@ def unify_clade_ids(datasets: List[Dataset], tree: Tree) -> None:
                               "last one is used")
 
 
+def resolve_ambiguous_symbols(datasets: List[Dataset]) -> None:
+    """
+    A symbol value that names several legend entries ('A / B': same shape and
+    colour, e.g. a file that draws every symbol as a circle) is settled from
+    another dataset in the run that gives the same id exactly one of them.
+    """
+    for d in datasets:
+        if d.kind != "DATASET_SYMBOL":
+            continue
+        fixed, left = 0, 0
+        for rid, row in d.rows.items():
+            for k, v in list(row.items()):
+                if " / " not in v:
+                    continue
+                cands = set(v.split(" / "))
+                found = {ov for o in datasets if o is not d for ov in o.rows.get(rid, {}).values()} & cands
+                if len(found) != 1:
+                    left += 1
+                    continue
+                new = found.pop()
+                row[k] = new
+                fixed += 1
+                colour = next((c for kk, vv, c in d.colors if kk == k and vv == v), None)
+                if colour and not any(kk == k and vv == new for kk, vv, _ in d.colors):
+                    d.colors.append((k, new, colour))
+                if (k, v) in d.shapes:
+                    d.shapes.setdefault((k, new), d.shapes[(k, v)])
+        if not fixed:
+            continue
+        used = {(k, v) for r in d.rows.values() for k, v in r.items()}
+        d.colors = [(k, v, c) for k, v, c in d.colors if v.startswith("(") or (k, v) in used]
+        if not left:
+            d.warnings = [w for w in d.warnings if "match several legend entries" not in w]
+        d.notes.append(f"{plural(fixed, 'symbol')} matched several legend entries (same shape and colour); each took "
+                       "the value another file in this run gives the same leaf"
+                       + (f" ({plural(left, 'symbol')} could not be settled and still name all of them)" if left else "") + ".")
+
+
 def clade_rows_without_tree(datasets: List[Dataset]) -> bool:
     """Decoration columns with "A|B" rows (no --tree): differently spelled ones would hide each other in mitol."""
     for d in datasets:
@@ -2786,6 +2824,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         report.append((name, f"skip  {name}: {skipped[-1][1]}"))
     if tree is not None:
         unify_clade_ids(datasets, tree)
+    resolve_ambiguous_symbols(datasets)
 
     def print_report() -> None:
         for _, item in report:
