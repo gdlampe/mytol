@@ -27,7 +27,7 @@ Added in this fork (`updates` branch):
 
 - **Load several CSV/TSV files at once**, drag rings into any order, hide rings without leaving a gap
 - **Continuous colouring**: gradient presets or custom stops, eyedropper, bar colour, min/max, log scale (any base)
-- **Per-category shading**: shade each category of a ring by a numeric column (e.g. type A white→blue, type B white→red)
+- **Per-category shading**: shade each category of a ring by a numeric column (e.g. type A white→blue, type B white→red); worked example with a colour key in [`example/family_shading/`](example/family_shading/README.md)
 - **Find by annotation**: select leaves by value; on-canvas legend with drag-to-reorder sections and items
 - **Ring borders and gaps**, copy/paste ring styles, delete/restore columns, export the annotations on the tree
 - **Sessions**: save/load everything (data, view, filters, selection, legend, styles) as one JSON file

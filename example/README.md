@@ -4,6 +4,7 @@
 |------|------------|
 | `RTtree.nwk` | Reverse-transcriptase tree, 6,734 leaves named by UniProt accession (e.g. `A0A6U3JU95`), support values on internal nodes. |
 | `RTtreelabels.csv` | Original table: `id`, `label` (RT class), `randomnumber`, `organism`, `UGness`; 6,723 rows (11 leaves missing). Loaded by **Load example data**. |
+| `family_shading/` | A second worked example: one ring coloured by category and shaded by a number (a family + a %), with a colour key. See [`family_shading/README.md`](family_shading/README.md). |
 | `annotations_example.tsv` | One row per leaf (6,734 rows) with nine columns that cover every ring style. See [Columns](#columns). |
 
 `organism` in `RTtreelabels.csv` is a coarse flag (`eukaryote` only for `LTR/Retroviral/YR`, `bacterial` for every other class, non-LTR and TERT included), so it disagrees with `host_group` below.
