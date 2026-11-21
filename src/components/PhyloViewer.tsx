@@ -785,6 +785,15 @@ export default function Phylo() {
     if (t) deletedStyleStash.current.set(key, { track: t, colors: colorMaps.get(key) });
     setDeletedColumns(prev => new Set(prev).add(key));
   };
+  /** Bulk delete (same stash/restore behaviour as deleteColumn). */
+  const deleteColumns = (keys: string[]) => {
+    for (const key of keys) {
+      const t = trackConfig.find(c => c.key === key);
+      if (t) deletedStyleStash.current.set(key, { track: t, colors: colorMaps.get(key) });
+    }
+    setDeletedColumns(prev => new Set([...prev, ...keys]));
+    setShowLegendKey(prev => (prev && keys.includes(prev) ? null : prev));
+  };
 
   // Append annotation files. Parses them in parallel, then pushes the ones that
   // parsed onto the file list in the order given (one update) — the effect
@@ -1470,6 +1479,32 @@ export default function Phylo() {
   // on screen, so the world-space thickness shrinks as you zoom in.
   function trackWorldScale(): number {
     return tracksZoomWithTree ? 1 : 1 / gZoom;
+  }
+
+  // Scale bar geometry (shared by canvas draw and SVG export): a round branch
+  // length whose bar is 50-200px, or null when there is no phylogram scale.
+  function scaleBarSpec(W: number, H: number, maxX: number, trackWidth: number): { barLen: number; barPx: number; label: string } | null {
+    if (!phylogram) return null;
+    let pxPerUnit = 0;
+    if (layout === "rect") {
+      pxPerUnit = computeRectSx(W, maxX, trackWidth);
+    } else {
+      const R = Math.min(W, H) * CIRC_RADIUS_FRACTION;
+      const rScale = layout === "unrooted" && unrootedLayout
+        ? R / (unrootedLayout.maxR || 1)
+        : R / (maxX || 1);
+      pxPerUnit = rScale * gZoom;
+    }
+    if (!(pxPerUnit > 0)) return null;
+    const rawLen = 100 / pxPerUnit;
+    const mag = Math.pow(10, Math.floor(Math.log10(rawLen)));
+    let barLen = mag;
+    for (const m of [1, 2, 5, 10]) {
+      const candidate = mag * m;
+      if (candidate * pxPerUnit >= 50 && candidate * pxPerUnit <= 200) { barLen = candidate; break; }
+    }
+    const label = barLen < 0.01 ? barLen.toExponential(1) : barLen < 1 ? barLen.toPrecision(2) : String(barLen);
+    return { barLen, barPx: barLen * pxPerUnit, label };
   }
 
   // Computes the horizontal pixels-per-branch-length-unit for the rect layout.
@@ -2698,42 +2733,23 @@ export default function Phylo() {
     }
 
     // ---- Scale bar (screen space) ----
-    if (phylogram) {
-      let pxPerUnit = 0;
-      if (layout === "rect") {
-        pxPerUnit = computeRectSx(W, rectMaxX, effectiveTrackWidth);
-      } else {
-        const R = Math.min(W, H) * CIRC_RADIUS_FRACTION;
-        const rScale = layout === "unrooted" && unrootedLayout
-          ? R / (unrootedLayout.maxR || 1)
-          : R / (rectMaxX || 1);
-        pxPerUnit = rScale * gZoom;
-      }
-      if (pxPerUnit > 0) {
-        // Pick a nice round bar length: nearest power of 10 such that bar is 50–200px
-        const rawLen = 100 / pxPerUnit;
-        const mag = Math.pow(10, Math.floor(Math.log10(rawLen)));
-        const niceMults = [1, 2, 5, 10];
-        let barLen = mag;
-        for (const m of niceMults) {
-          const candidate = mag * m;
-          if (candidate * pxPerUnit >= 50 && candidate * pxPerUnit <= 200) { barLen = candidate; break; }
-        }
-        const barPx = barLen * pxPerUnit;
+    {
+      const sb = scaleBarSpec(W, H, rectMaxX, effectiveTrackWidth);
+      if (sb) {
         const bx = 16, by = H - 24;
         ctx.save();
         ctx.strokeStyle = "#333";
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(bx, by); ctx.lineTo(bx + barPx, by);
+        ctx.moveTo(bx, by); ctx.lineTo(bx + sb.barPx, by);
         ctx.moveTo(bx, by - 5); ctx.lineTo(bx, by + 5);
-        ctx.moveTo(bx + barPx, by - 5); ctx.lineTo(bx + barPx, by + 5);
+        ctx.moveTo(bx + sb.barPx, by - 5); ctx.lineTo(bx + sb.barPx, by + 5);
         ctx.stroke();
         ctx.fillStyle = "#333";
         ctx.font = "11px sans-serif";
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
-        ctx.fillText(barLen < 0.01 ? barLen.toExponential(1) : barLen < 1 ? barLen.toPrecision(2) : String(barLen), bx + barPx / 2, by + 7);
+        ctx.fillText(sb.label, bx + sb.barPx / 2, by + 7);
         ctx.restore();
       }
     }
@@ -4295,6 +4311,17 @@ export default function Phylo() {
     }
 
     // Legend at its on-screen position (same layout as the canvas).
+    // Scale bar (same geometry as the canvas)
+    {
+      const sb = scaleBarSpec(W, H, rectLayout?.maxX ?? 0, effectiveTrackW);
+      if (sb) {
+        const bx = 16, by = H - 24;
+        lines.push(`<g id="scale-bar" stroke="#333" stroke-width="2" fill="none">` +
+          `<path d="M ${f(bx)},${f(by)} L ${f(bx + sb.barPx)},${f(by)} M ${f(bx)},${f(by - 5)} L ${f(bx)},${f(by + 5)} M ${f(bx + sb.barPx)},${f(by - 5)} L ${f(bx + sb.barPx)},${f(by + 5)}"/>` +
+          `<text x="${f(bx + sb.barPx / 2)}" y="${f(by + 7)}" dominant-baseline="hanging" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#333" stroke="none">${esc(sb.label)}</text></g>`);
+      }
+    }
+
     const lb = legendBoxRef.current;
     const legendLayout = lb && measureCtx ? computeLegendLayout(measureCtx) : null;
     if (lb && legendLayout) lines.push(...legendToSvg(legendLayout, lb.x, lb.y));
@@ -5791,6 +5818,12 @@ export default function Phylo() {
                         <button className="btn" style={{ padding: "2px 5px", fontSize: 11 }} onClick={() => setShowLegendKey(track.key === showLegendKey ? null : track.key)}>
                           Style {showLegendKey === track.key ? "▴" : "▾"}
                         </button>
+                        <button className="btn btn-danger" style={{ padding: "2px 5px", fontSize: 11 }}
+                          title={isColumnRing(track) ? "Delete this annotation column (restore it from the list below)" : "Remove this ring (its columns stay loaded)"}
+                          aria-label={`${isColumnRing(track) ? "Delete column" : "Remove ring"} ${track.label}`}
+                          onClick={() => { if (isColumnRing(track)) deleteColumn(track.key); else removeRing(track.key); if (showLegendKey === track.key) setShowLegendKey(null); }}>
+                          ✕
+                        </button>
                       </div>
                     </div>
                     {/* Ring style editor */}
@@ -5847,6 +5880,22 @@ export default function Phylo() {
                   </div>
                 ))}
               </div>
+              {(() => {
+                const unchecked = trackConfig.filter(t => isColumnRing(t) && !t.visible);
+                if (unchecked.length === 0) return null;
+                return (
+                  <div style={{ marginTop: 6 }}>
+                    <button type="button" className="btn btn-danger" style={{ fontSize: 11, padding: "2px 8px" }}
+                      title="Untick the columns you want to drop, then delete them all at once (restore from the list below)"
+                      onClick={() => {
+                        if (window.confirm(`Delete ${unchecked.length} unticked annotation column${unchecked.length === 1 ? "" : "s"}?`))
+                          deleteColumns(unchecked.map(t => t.key));
+                      }}>
+                      Delete {unchecked.length} unticked column{unchecked.length === 1 ? "" : "s"}
+                    </button>
+                  </div>
+                );
+              })()}
               <AddRingForm
                 columns={columnChoices}
                 onAdd={(kind, fields, label) => addRing(kind, fields, label)}
